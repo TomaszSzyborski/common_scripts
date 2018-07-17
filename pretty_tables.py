@@ -1,5 +1,6 @@
 import itertools
-import tabulate
+from tabulate import tabulate
+
 possibilities = ["incorrect","correct","empty"]
 all_options = itertools.product(possibilities, repeat=2)
 
