@@ -1,11 +1,11 @@
 # Caesar Cipher
 MAX_KEY_SIZE = 26
 def getMode():
-	while True:
-		print('Do you wish to encrypt or decrypt or brute force a message?')
-		mode = input().lower()
-		if mode in 'encrypt e decrypt d brute b'.split():
-			return mode[0]
+    while True:
+        print('Do you wish to encrypt or decrypt or brute force a message?')
+        mode = input().lower()
+        if mode in 'encrypt e decrypt d brute b'.split():
+            return mode[0]
         else:
             print('Enter either "encrypt" or "e" or "decrypt" or "d" or "brute" or "b".')
 
@@ -47,11 +47,11 @@ def getTranslatedMessage(mode, message, key):
 mode = getMode()
 message = getMessage()
 if mode[0] != 'b':
-	key = getKey()
+    key = getKey()
 
 print('Your translated text is:')
 if mode[0] != 'b':
-	print(getTranslatedMessage(mode, message, key))
+    print(getTranslatedMessage(mode, message, key))
 else:
-	for key in range(1, MAX_KEY_SIZE + 1):
-		print(key, getTranslatedMessage('decrypt', message, key))
+    for key in range(1, MAX_KEY_SIZE + 1):
+        print(key, getTranslatedMessage('decrypt', message, key))
