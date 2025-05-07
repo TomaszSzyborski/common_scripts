@@ -1,4 +1,109 @@
-#!/usr/bin/env python3
+def get_commit(self, commit_id):
+        """
+        Get a specific commit.
+        
+        Args:
+            commit_id (str): Commit ID
+            
+        Returns:
+            dict: Commit information
+        """
+        url = f"{self.api_base}/commits/{commit_id}"
+        
+        try:
+            return self.make_request(url)
+        except requests.exceptions.HTTPError as e:
+            print(f"Error retrieving commit {commit_id}: {e}")
+            return Nonedef analyze_commit_range(self, from_commit_id, to_commit_id):
+        """
+        Analyze changes between two commits.
+        
+        Args:
+            from_commit_id (str): Start commit ID
+            to_commit_id (str): End commit ID
+            
+        Returns:
+            dict: Analysis results
+        """
+        print(f"Analyzing changes between {from_commit_id} and {to_commit_id}...")
+        
+        # Get from commit details
+        from_commit = self.get_commit(from_commit_id)
+        
+        # Get to commit details
+        to_commit = self.get_commit(to_commit_id)
+        
+        if not from_commit or not to_commit:
+            print("Error: Could not retrieve commit information")
+            return None
+            
+        # Get changed files between these commits
+        changes = self.get_commit_changes(from_commit_id, to_commit_id)
+        print(f"Found {len(changes)} changed files between commits")
+        
+        stats = {
+            'files': {
+                'added': [],
+                'removed': [],
+                'modified': []
+            },
+            'loc': {
+                'added': 0,
+                'removed': 0,
+                'modified': 0
+            }
+        }
+        
+        for change in changes:
+            path = change.get('path', {}).get('toString')
+            if not path:
+                continue
+                
+            # Determine file status
+            file_type = change.get('type')
+            if file_type == 'ADD':
+                stats['files']['added'].append(path)
+            elif file_type == 'DELETE':
+                stats['files']['removed'].append(path)
+            elif file_type in ['MODIFY', 'MOVE']:
+                stats['files']['modified'].append(path)
+            
+            # Skip binary files
+            content_id = change.get('contentId')
+            if not content_id:
+                print(f"Skipping binary file or directory: {path}")
+                continue
+                
+            # Get diff for this file between the two commits
+            file_diff = self.get_file_diff(to_commit_id, path, from_commit_id)
+            file_stats = self.analyze_file_diff(file_diff)
+            
+            # Update stats
+            stats['loc']['added'] += file_stats['loc_added']
+            stats['loc']['removed'] += file_stats['loc_removed'] 
+            stats['loc']['modified'] += file_stats['loc_modified']
+            
+        return {
+            'from_commit': {
+                'id': from_commit['id'],
+                'author': {
+                    'name': from_commit.get('author', {}).get('name', 'Unknown'),
+                    'email': from_commit.get('author', {}).get('emailAddress', 'Unknown')
+                },
+                'date': datetime.fromtimestamp(from_commit.get('authorTimestamp') / 1000).isoformat(),
+                'message': from_commit.get('message', '')
+            },
+            'to_commit': {
+                'id': to_commit['id'],
+                'author': {
+                    'name': to_commit.get('author', {}).get('name', 'Unknown'),
+                    'email': to_commit.get('author', {}).get('emailAddress', 'Unknown')
+                },
+                'date': datetime.fromtimestamp(to_commit.get('authorTimestamp') / 1000).isoformat(),
+                'message': to_commit.get('message', '')
+            },
+            'stats': stats
+        }#!/usr/bin/env python3
 """
 Bitbucket Commit Analysis Script
 
@@ -8,15 +113,19 @@ and calculates LOC (Lines of Code) statistics including additions, removals, and
 
 Usage:
     python bitbucket_commit_analysis.py --repo PROJECT/REPO --branch develop [options]
+    python bitbucket_commit_analysis.py --repo PROJECT/REPO --from-commit abc123 --to-commit def456 [options]
 
 Args:
     --repo: Repository in format PROJECT/REPO
     --branch: Branch to analyze (default: develop)
+    --from-commit: Starting commit ID for comparison
+    --to-commit: Ending commit ID for comparison
     --server: Bitbucket server URL (default: http://localhost:7990)
     --username: Bitbucket username
     --password: Bitbucket password (use environment variable instead for security)
     --token: Bitbucket access token (alternative to username/password)
     --output: Output file path for JSON results (optional)
+    --csv: Output file path for CSV author statistics (optional)
 """
 
 import argparse
@@ -152,12 +261,13 @@ class BitbucketCommitAnalyzer:
         # Merge commits typically have more than one parent
         return [commit for commit in commits if len(commit.get('parents', [])) > 1]
     
-    def get_commit_changes(self, commit_id):
+    def get_commit_changes(self, commit_id, until_commit_id=None):
         """
-        Get files changed in a specific commit.
+        Get files changed in a specific commit or between two commits.
         
         Args:
-            commit_id (str): Commit ID
+            commit_id (str): Base commit ID
+            until_commit_id (str, optional): End commit ID for comparison
             
         Returns:
             list: List of changed files
@@ -167,30 +277,55 @@ class BitbucketCommitAnalyzer:
             'limit': 1000  # Use a high limit to get all changes in one request
         }
         
+        # If comparing between two commits
+        if until_commit_id:
+            params['since'] = commit_id
+            params['until'] = until_commit_id
+            url = f"{self.api_base}/changes"
+            print(f"Comparing changes between {commit_id} and {until_commit_id}")
+        
         response = self.make_request(url, params=params)
         return response.get('values', [])
     
-    def get_file_diff(self, commit_id, path):
+    def get_file_diff(self, commit_id, path, since_commit_id=None):
         """
-        Get diff for a specific file in a commit.
+        Get diff for a specific file in a commit or between two commits.
         
         Args:
-            commit_id (str): Commit ID
+            commit_id (str): Base commit ID
             path (str): File path
+            since_commit_id (str, optional): Start commit ID for comparison
             
         Returns:
             dict: Diff information
         """
-        url = f"{self.api_base}/commits/{commit_id}/diff/{path}"
-        
-        try:
-            return self.make_request(url)
-        except requests.exceptions.HTTPError as e:
-            if e.response.status_code == 404:
-                # File not found or binary file
-                print(f"Warning: Could not get diff for file {path} (possibly binary or deleted)")
-                return None
-            raise
+        # If comparing between two commits
+        if since_commit_id:
+            url = f"{self.api_base}/compare/diff"
+            params = {
+                'from': since_commit_id,
+                'to': commit_id,
+                'path': path
+            }
+            try:
+                return self.make_request(url, params=params)
+            except requests.exceptions.HTTPError as e:
+                if e.response.status_code == 404:
+                    # File not found or binary file
+                    print(f"Warning: Could not get diff for file {path} between {since_commit_id} and {commit_id} (possibly binary or deleted)")
+                    return None
+                raise
+        else:
+            # Single commit diff
+            url = f"{self.api_base}/commits/{commit_id}/diff/{path}"
+            try:
+                return self.make_request(url)
+            except requests.exceptions.HTTPError as e:
+                if e.response.status_code == 404:
+                    # File not found or binary file
+                    print(f"Warning: Could not get diff for file {path} (possibly binary or deleted)")
+                    return None
+                raise
     
     def analyze_file_diff(self, diff):
         """
@@ -210,21 +345,25 @@ class BitbucketCommitAnalyzer:
         
         if not diff:
             return stats
-            
-        for hunk in diff.get('hunks', []):
-            for segment in hunk.get('segments', []):
-                segment_type = segment.get('type')
-                lines = segment.get('lines', [])
-                
-                if segment_type == 'ADDED':
-                    stats['loc_added'] += len(lines)
-                    stats['loc_modified'] += len(lines)
-                elif segment_type == 'REMOVED':
-                    stats['loc_removed'] += len(lines)
-                    stats['loc_modified'] += len(lines)
-                elif segment_type == 'CONTEXT':
-                    # Context lines are unchanged
-                    pass
+        
+        # Process each diff in the response
+        for diff_item in diff.get('diffs', []):
+            # Process each hunk in the diff
+            for hunk in diff_item.get('hunks', []):
+                # Process each segment in the hunk
+                for segment in hunk.get('segments', []):
+                    segment_type = segment.get('type')
+                    lines = segment.get('lines', [])
+                    
+                    if segment_type == 'ADDED':
+                        stats['loc_added'] += len(lines)
+                        stats['loc_modified'] += len(lines)
+                    elif segment_type == 'REMOVED':
+                        stats['loc_removed'] += len(lines)
+                        stats['loc_modified'] += len(lines)
+                    elif segment_type == 'CONTEXT':
+                        # Context lines are unchanged
+                        pass
                     
         return stats
     
@@ -430,6 +569,8 @@ def parse_arguments():
     parser.add_argument('--token', help='Bitbucket access token')
     parser.add_argument('--output', help='Output file path for JSON results')
     parser.add_argument('--csv', help='Output file path for CSV author statistics (default: auto-generated)')
+    parser.add_argument('--from-commit', help='Starting commit ID for comparison')
+    parser.add_argument('--to-commit', help='Ending commit ID for comparison')
     
     return parser.parse_args()
 
@@ -504,18 +645,108 @@ def main():
         token=args.token
     )
     
-    # Run analysis
-    results = analyzer.analyze_commits()
-    
-    # Generate CSV stats file with author information
-    csv_filename = args.csv if args.csv else f"{args.repo.replace('/', '_')}_{args.branch}_stats.csv"
-    export_to_csv(results, csv_filename)
-    
-    # Output JSON results if requested
-    if args.output:
-        with open(args.output, 'w') as f:
-            json.dump(results, f, indent=2)
-        print(f"Results saved to {args.output}")
+    # If from and to commits are specified, analyze that range
+    if args.from_commit and args.to_commit:
+        results = analyzer.analyze_commit_range(args.from_commit, args.to_commit)
+        
+        if not results:
+            print("Error analyzing commit range")
+            sys.exit(1)
+            
+        # Output JSON results if requested
+        if args.output:
+            with open(args.output, 'w') as f:
+                json.dump(results, f, indent=2)
+            print(f"Results saved to {args.output}")
+            
+        # Generate CSV stats file with author information
+        if args.csv:
+            # Create a simpler structure for CSV export
+            csv_results = {
+                'repository': args.repo,
+                'branch': args.branch,
+                'total_commits': 1,  # Just the comparison
+                'initial_commit': None,
+                'merge_commits': [],
+                'stats': {
+                    'files': results['stats']['files'],
+                    'loc': results['stats']['loc'],
+                    'authors': {
+                        results['from_commit']['author']['name']: {
+                            'name': results['from_commit']['author']['name'],
+                            'email': results['from_commit']['author']['email'],
+                            'commits': 1
+                        },
+                        results['to_commit']['author']['name']: {
+                            'name': results['to_commit']['author']['name'],
+                            'email': results['to_commit']['author']['email'],
+                            'commits': 1
+                        }
+                    }
+                }
+            }
+            export_to_csv(csv_results, args.csv)
+        
+        # Print summary
+        print("\n=== Commit Range Analysis ===")
+        print(f"From commit: {results['from_commit']['id']} ({results['from_commit']['date']})")
+        print(f"  Author: {results['from_commit']['author']['name']} <{results['from_commit']['author']['email']}>")
+        print(f"  Message: {results['from_commit']['message']}")
+        print(f"To commit: {results['to_commit']['id']} ({results['to_commit']['date']})")
+        print(f"  Author: {results['to_commit']['author']['name']} <{results['to_commit']['author']['email']}>")
+        print(f"  Message: {results['to_commit']['message']}")
+        
+        print("\nFile statistics:")
+        print(f"  Added: {len(results['stats']['files']['added'])}")
+        print(f"  Removed: {len(results['stats']['files']['removed'])}")
+        print(f"  Modified: {len(results['stats']['files']['modified'])}")
+        
+        print("\nLOC statistics:")
+        print(f"  Added: {results['stats']['loc']['added']}")
+        print(f"  Removed: {results['stats']['loc']['removed']}")
+        print(f"  Modified: {results['stats']['loc']['modified']}")
+        print(f"  Net change: {results['stats']['loc']['added'] - results['stats']['loc']['removed']}")
+        
+    else:
+        # Run regular analysis
+        results = analyzer.analyze_commits()
+        
+        # Generate CSV stats file with author information
+        csv_filename = args.csv if args.csv else f"{args.repo.replace('/', '_')}_{args.branch}_stats.csv"
+        export_to_csv(results, csv_filename)
+        
+        # Output JSON results if requested
+        if args.output:
+            with open(args.output, 'w') as f:
+                json.dump(results, f, indent=2)
+            print(f"Results saved to {args.output}")
+            
+        # Print summary to console
+        print("\n=== Summary ===")
+        print(f"Repository: {results['repository']}")
+        print(f"Branch: {results['branch']}")
+        print(f"Total commits: {results['total_commits']}")
+        print(f"Merge commits: {len(results['merge_commits'])}")
+        
+        print("\nFile statistics:")
+        print(f"  Added: {results['stats']['files']['added']}")
+        print(f"  Removed: {results['stats']['files']['removed']}")
+        print(f"  Modified: {results['stats']['files']['modified']}")
+        
+        print("\nLOC statistics:")
+        print(f"  Added: {results['stats']['loc']['added']}")
+        print(f"  Removed: {results['stats']['loc']['removed']}")
+        print(f"  Modified: {results['stats']['loc']['modified']}")
+        print(f"  Net change: {results['stats']['loc']['added'] - results['stats']['loc']['removed']}")
+        
+        print("\nAuthor statistics:")
+        for author, stats in results['stats']['authors'].items():
+            print(f"  {author}:")
+            print(f"    Commits: {stats['commits']}")
+            print(f"    LOC added: {stats['loc_added']}")
+            print(f"    LOC removed: {stats['loc_removed']}")
+            print(f"    Files changed: {stats['files_changed']}")
+            print(f"    Net LOC change: {stats['loc_added'] - stats['loc_removed']}")
     
     # Print summary to console
     print("\n=== Summary ===")
