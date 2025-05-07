@@ -1,426 +1,451 @@
-#!/usr/bin/env python3
-"""
-Bitbucket Repository Analyzer
-
-This script analyzes Bitbucket on-premise server repositories, focusing on initial 
-and merge commits. It retrieves file lists for each commit, performs diffs between 
-commits, and analyzes changes to categorize files as added, modified, deleted, or 
-moved, along with calculating Lines of Code (LOC) metrics per author.
-"""
-
 import requests
 import json
-import argparse
-import sys
-import re
 from collections import defaultdict
 from datetime import datetime
+import argparse
 import logging
-import os
-from urllib.parse import urljoin
-import csv
 
-# Set up logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler("bitbucket_analysis.log"),
-        logging.StreamHandler(sys.stdout)
-    ]
-)
-logger = logging.getLogger("BitbucketAnalyzer")
 
 class BitbucketAnalyzer:
-    def __init__(self, server_url, username, password, project_key, repo_slug, 
-                 verify_ssl=True, output_dir="output"):
+    """
+    A class to analyze Bitbucket repositories, focusing on merge commits
+    to track file changes and author contributions.
+    """
+    
+    def __init__(self, server_url, project_key, repository_slug, auth=None):
         """
-        Initialize the BitbucketAnalyzer with server connection details.
+        Initialize the BitbucketAnalyzer with server and repo information.
         
         Args:
-            server_url (str): Base URL of the Bitbucket server
-            username (str): Username for authentication
-            password (str): Password or token for authentication
-            project_key (str): Bitbucket project key
-            repo_slug (str): Repository slug
-            verify_ssl (bool): Whether to verify SSL certificates
-            output_dir (str): Directory to save output files
+            server_url (str): The Bitbucket server URL
+            project_key (str): The project key
+            repository_slug (str): The repository slug
+            auth (tuple, optional): Basic auth tuple (username, password/token)
         """
         self.server_url = server_url.rstrip('/')
-        self.auth = (username, password)
         self.project_key = project_key
-        self.repo_slug = repo_slug
-        self.verify_ssl = verify_ssl
-        self.output_dir = output_dir
+        self.repository_slug = repository_slug
+        self.auth = auth
+        self.base_url = f"{self.server_url}/rest/api/latest/projects/{self.project_key}/repos/{self.repository_slug}"
+        self.session = requests.Session()
         
-        # Base API URL for this repository
-        self.api_base = f"{self.server_url}/rest/api/1.0/projects/{project_key}/repos/{repo_slug}"
-        
-        # Ensure output directory exists
-        os.makedirs(output_dir, exist_ok=True)
-        
-        # Store commit history
-        self.commits = []
-        self.commit_map = {}  # Map commit IDs to their data
-        self.file_history = defaultdict(list)  # Track file changes across commits
-        self.author_stats = defaultdict(lambda: {
+        if auth:
+            self.session.auth = auth
+            
+        # Data tracking
+        self.authors = defaultdict(lambda: {
             'commits': 0,
-            'files_added': 0,
-            'files_modified': 0,
-            'files_deleted': 0,
-            'files_moved': 0,
             'lines_added': 0,
-            'lines_removed': 0
+            'lines_removed': 0,
+            'files_added': 0,
+            'files_removed': 0,
+            'files_modified': 0
         })
+        self.file_history = {}
         
-        logger.info(f"Initialized BitbucketAnalyzer for {project_key}/{repo_slug}")
-
-    def _make_request(self, endpoint, method="GET", params=None, data=None):
-        """Make an API request to the Bitbucket server."""
-        url = urljoin(self.api_base, endpoint)
+        # Set up logging
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s'
+        )
+        self.logger = logging.getLogger('BitbucketAnalyzer')
+    
+    def get_commits(self):
+        """
+        Get all commits from the repository, focusing on initial commit and merge commits.
         
-        try:
-            response = requests.request(
-                method=method,
-                url=url,
-                auth=self.auth,
-                params=params,
-                json=data,
-                verify=self.verify_ssl
-            )
-            response.raise_for_status()
-            return response.json()
-        except requests.exceptions.RequestException as e:
-            logger.error(f"API request failed: {e}")
-            if hasattr(e.response, 'text'):
-                logger.error(f"Response: {e.response.text}")
-            raise
-
-    def fetch_all_commits(self):
-        """Fetch all commits from the repository."""
-        logger.info("Fetching all commits...")
+        Returns:
+            list: A list of commit objects
+        """
+        self.logger.info(f"Fetching commits for {self.project_key}/{self.repository_slug}")
         
-        all_commits = []
-        start = 0
-        limit = 100
+        # First, get the initial commit
+        initial_commit = self._get_initial_commit()
+        if not initial_commit:
+            self.logger.error("Could not find initial commit")
+            return []
+            
+        # Then get all merge commits
+        merge_commits = self._get_merge_commits()
+        
+        # Create the final ordered list starting with initial commit
+        commits = [initial_commit] + merge_commits
+        
+        self.logger.info(f"Found {len(commits)} commits (initial + {len(merge_commits)} merge commits)")
+        return commits
+    
+    def _get_initial_commit(self):
+        """
+        Get the initial commit of the repository.
+        
+        Returns:
+            dict: The initial commit object
+        """
+        url = f"{self.base_url}/commits"
+        params = {
+            'until': 'master',
+            'order': 'OLDEST',
+            'limit': 1
+        }
+        
+        response = self.session.get(url, params=params)
+        
+        if response.status_code == 200:
+            data = response.json()
+            if data.get('values') and len(data['values']) > 0:
+                return data['values'][0]
+        
+        self.logger.error(f"Error fetching initial commit: {response.status_code}")
+        return None
+    
+    def _get_merge_commits(self):
+        """
+        Get all merge commits in the repository.
+        
+        Returns:
+            list: A list of merge commit objects
+        """
+        merge_commits = []
+        url = f"{self.base_url}/commits"
+        params = {
+            'merges': 'only',
+            'limit': 100,
+            'start': 0
+        }
         
         while True:
-            params = {
-                'start': start,
-                'limit': limit
-            }
+            response = self.session.get(url, params=params)
             
-            response = self._make_request('commits', params=params)
-            values = response.get('values', [])
+            if response.status_code != 200:
+                self.logger.error(f"Error fetching merge commits: {response.status_code}")
+                break
+            
+            data = response.json()
+            values = data.get('values', [])
             
             if not values:
                 break
                 
-            all_commits.extend(values)
+            merge_commits.extend(values)
             
-            # Check if we need to fetch more
-            is_last_page = response.get('isLastPage', True)
+            # Check if there are more commits to fetch
+            is_last_page = data.get('isLastPage', True)
             if is_last_page:
                 break
                 
-            start = response.get('nextPageStart')
-        
-        logger.info(f"Fetched {len(all_commits)} commits")
-        return all_commits
-
-    def identify_important_commits(self):
-        """Identify initial commit and merge commits."""
-        logger.info("Identifying initial and merge commits...")
-        
-        all_commits = self.fetch_all_commits()
+            params['start'] = data.get('nextPageStart', 0)
         
         # Sort commits by date (oldest first)
-        sorted_commits = sorted(all_commits, key=lambda c: c['authorTimestamp'])
+        merge_commits.sort(key=lambda c: datetime.strptime(c.get('authorTimestamp', 0) / 1000, '%Y-%m-%d %H:%M:%S'))
         
-        # Get the initial commit
-        initial_commit = sorted_commits[0] if sorted_commits else None
+        return merge_commits
+    
+    def analyze_changes(self, commits):
+        """
+        Analyze changes between successive commits and gather statistics.
         
-        # Identify merge commits (those with multiple parents)
-        merge_commits = [c for c in all_commits if len(c.get('parents', [])) > 1]
+        Args:
+            commits (list): List of commit objects to analyze
+        """
+        self.logger.info("Analyzing changes between commits")
         
-        # Create a list of commits to analyze
-        important_commits = []
-        if initial_commit:
-            important_commits.append(initial_commit)
-            logger.info(f"Initial commit: {initial_commit['id']} by {initial_commit['author']['name']}")
+        # Process each commit in order
+        for i, current_commit in enumerate(commits):
+            # Skip the first commit (it doesn't have a parent to compare to)
+            if i == 0:
+                self._process_initial_commit(current_commit)
+                continue
+                
+            # Get the previous commit to compare against
+            previous_commit = commits[i-1]
             
-        for commit in merge_commits:
-            important_commits.append(commit)
-            logger.info(f"Merge commit: {commit['id']} by {commit['author']['name']}")
+            self._analyze_commit_changes(current_commit, previous_commit)
+    
+    def _process_initial_commit(self, commit):
+        """
+        Process the initial commit, tracking all files as "added".
         
-        # Add all important commits to the commit map
-        for commit in important_commits:
-            self.commit_map[commit['id']] = commit
+        Args:
+            commit (dict): The initial commit object
+        """
+        commit_id = commit.get('id')
+        author = commit.get('author', {}).get('displayName', 'Unknown')
+        self.logger.info(f"Processing initial commit: {commit_id[:8]} by {author}")
+        
+        # Fetch the changes for the initial commit
+        url = f"{self.base_url}/commits/{commit_id}/changes"
+        params = {'limit': 1000}
+        
+        response = self.session.get(url, params=params)
+        
+        if response.status_code != 200:
+            self.logger.error(f"Error fetching changes for initial commit: {response.status_code}")
+            return
             
-        # Sort important commits by timestamp
-        important_commits = sorted(important_commits, key=lambda c: c['authorTimestamp'])
-        self.commits = important_commits
+        data = response.json()
+        changes = data.get('values', [])
         
-        return important_commits
-
-    def get_commit_files(self, commit_id):
-        """Get list of files in a specific commit."""
-        logger.info(f"Getting files for commit {commit_id}")
+        # Process all files in the initial commit as "added"
+        for change in changes:
+            path = change.get('path', {}).get('toString', '')
+            content_id = change.get('contentId', '')
+            
+            # Track the file
+            self.file_history[path] = {
+                'commit_id': commit_id,
+                'author': author,
+                'content_id': content_id,
+                'status': 'ADDED'
+            }
+            
+            # Update author stats
+            self.authors[author]['commits'] += 1
+            self.authors[author]['files_added'] += 1
+            
+            # Update line counts if available
+            if 'size' in change:
+                self.authors[author]['lines_added'] += change.get('size', 0)
+    
+    def _analyze_commit_changes(self, current_commit, previous_commit):
+        """
+        Analyze changes between two commits.
         
-        endpoint = f"commits/{commit_id}/changes"
-        params = {'limit': 1000}  # Adjust if you have more files per commit
+        Args:
+            current_commit (dict): The current commit object
+            previous_commit (dict): The previous commit object to compare against
+        """
+        current_id = current_commit.get('id')
+        previous_id = previous_commit.get('id')
+        author = current_commit.get('author', {}).get('displayName', 'Unknown')
         
-        try:
-            response = self._make_request(endpoint, params=params)
-            return response.get('values', [])
-        except Exception as e:
-            logger.error(f"Failed to get files for commit {commit_id}: {e}")
-            return []
-
-    def get_file_diff(self, from_commit, to_commit, file_path):
-        """Get the diff for a specific file between two commits."""
-        logger.info(f"Getting diff for {file_path} between {from_commit} and {to_commit}")
+        self.logger.info(f"Analyzing changes: {previous_id[:8]} → {current_id[:8]} by {author}")
         
-        endpoint = "compare/diff"
+        # Fetch the changes between the two commits
+        url = f"{self.base_url}/commits/{current_id}/changes"
         params = {
-            'from': from_commit,
-            'to': to_commit,
-            'path': file_path
+            'since': previous_id,
+            'start': 0,
+            'limit': 1000
         }
         
-        try:
-            response = requests.get(
-                f"{self.api_base}/{endpoint}",
-                auth=self.auth,
-                params=params,
-                verify=self.verify_ssl
-            )
-            # Diff is returned as text, not JSON
-            return response.text
-        except Exception as e:
-            logger.error(f"Failed to get diff: {e}")
-            return ""
-
-    def parse_diff(self, diff_text):
-        """
-        Parse diff text to extract lines added/removed.
+        response = self.session.get(url, params=params)
         
-        Returns:
-            tuple: (lines_added, lines_removed)
-        """
-        if not diff_text:
-            return 0, 0
+        if response.status_code != 200:
+            self.logger.error(f"Error fetching changes between commits: {response.status_code}")
+            return
             
+        data = response.json()
+        changes = data.get('values', [])
+        
+        # Process all changes
+        for change in changes:
+            path = change.get('path', {}).get('toString', '')
+            content_id = change.get('contentId', '')
+            node_type = change.get('nodeType', '')
+            type_of_change = change.get('type', '')
+            
+            # Update author stats
+            self.authors[author]['commits'] = self.authors[author]['commits'] + 1 if i == 0 else self.authors[author]['commits']
+            
+            # Track file changes
+            if type_of_change == 'ADD':
+                self.file_history[path] = {
+                    'commit_id': current_id,
+                    'author': author,
+                    'content_id': content_id,
+                    'status': 'ADDED'
+                }
+                self.authors[author]['files_added'] += 1
+                self.authors[author]['lines_added'] += change.get('size', 0)
+                
+            elif type_of_change == 'DELETE':
+                if path in self.file_history:
+                    self.file_history[path]['status'] = 'DELETED'
+                    self.file_history[path]['deleted_by'] = author
+                    self.file_history[path]['deleted_in'] = current_id
+                
+                self.authors[author]['files_removed'] += 1
+                self.authors[author]['lines_removed'] += change.get('size', 0)
+                
+            elif type_of_change == 'MOVE':
+                source_path = change.get('srcPath', {}).get('toString', '')
+                
+                # Update the file history for the source path
+                if source_path in self.file_history:
+                    self.file_history[source_path]['status'] = 'MOVED'
+                    self.file_history[source_path]['moved_to'] = path
+                
+                # Add the new path
+                self.file_history[path] = {
+                    'commit_id': current_id,
+                    'author': author,
+                    'content_id': content_id,
+                    'status': 'ADDED',
+                    'moved_from': source_path
+                }
+                
+                # This is considered a modification
+                self.authors[author]['files_modified'] += 1
+                
+            elif type_of_change == 'MODIFY':
+                # Update existing file stats
+                if path in self.file_history:
+                    old_content_id = self.file_history[path].get('content_id', '')
+                    
+                    # Only count as modified if content actually changed
+                    if old_content_id != content_id:
+                        self.file_history[path]['content_id'] = content_id
+                        self.file_history[path]['last_modified_by'] = author
+                        self.file_history[path]['last_modified_in'] = current_id
+                        
+                        # Update line count stats
+                        self.authors[author]['files_modified'] += 1
+                        
+                        # For modifications, we need to get the specific line changes
+                        self._update_line_changes(current_id, path, author)
+    
+    def _update_line_changes(self, commit_id, path, author):
+        """
+        Get detailed line changes for a modified file.
+        
+        Args:
+            commit_id (str): The commit ID
+            path (str): The file path
+            author (str): The author's name
+        """
+        url = f"{self.base_url}/commits/{commit_id}/diff/{path}"
+        
+        response = self.session.get(url)
+        
+        if response.status_code != 200:
+            self.logger.warning(f"Could not get diff for {path} in commit {commit_id[:8]}")
+            return
+            
+        diff_content = response.text
+        
+        # Parse the diff to get line changes
         lines_added = 0
         lines_removed = 0
         
-        for line in diff_text.split('\n'):
+        for line in diff_content.split('\n'):
             if line.startswith('+') and not line.startswith('+++'):
                 lines_added += 1
             elif line.startswith('-') and not line.startswith('---'):
                 lines_removed += 1
-                
-        return lines_added, lines_removed
-
-    def analyze_commit(self, commit, previous_commit=None):
-        """
-        Analyze changes in a commit compared to previous commit.
-        
-        Args:
-            commit: Current commit data
-            previous_commit: Previous commit for comparison, or None for initial commit
-            
-        Returns:
-            dict: Analysis results for this commit
-        """
-        commit_id = commit['id']
-        commit_files = self.get_commit_files(commit_id)
-        
-        # Initialize stats for this commit
-        commit_stats = {
-            'id': commit_id,
-            'author': commit['author']['name'],
-            'email': commit['author']['emailAddress'],
-            'timestamp': commit['authorTimestamp'],
-            'date': datetime.fromtimestamp(commit['authorTimestamp'] / 1000).strftime('%Y-%m-%d %H:%M:%S'),
-            'message': commit['message'],
-            'files_added': [],
-            'files_modified': [],
-            'files_deleted': [],
-            'files_moved': [],
-            'lines_added': 0,
-            'lines_removed': 0
-        }
         
         # Update author stats
-        author = commit['author']['name']
-        self.author_stats[author]['commits'] += 1
+        self.authors[author]['lines_added'] += lines_added
+        self.authors[author]['lines_removed'] += lines_removed
+    
+    def generate_report(self):
+        """
+        Generate a report of author contributions and file statistics.
         
-        # Get previous files if we have a previous commit
-        previous_files = set()
-        if previous_commit:
-            previous_files_data = self.get_commit_files(previous_commit['id'])
-            previous_files = {f['path'] for f in previous_files_data}
+        Returns:
+            dict: Report data
+        """
+        self.logger.info("Generating final report")
         
-        # Current files
-        current_files = {f['path'] for f in commit_files}
+        # Calculate current file counts
+        current_files = {}
+        for path, info in self.file_history.items():
+            if info.get('status') not in ['DELETED', 'MOVED']:
+                current_files[path] = info
         
-        # Detect added/deleted files
-        added_files = current_files - previous_files if previous_commit else current_files
-        deleted_files = previous_files - current_files if previous_commit else set()
+        # Prepare the report
+        report = {
+            'repository': f"{self.project_key}/{self.repository_slug}",
+            'analysis_date': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            'author_stats': dict(self.authors),
+            'file_counts': {
+                'total_files_ever': len(self.file_history),
+                'current_files': len(current_files),
+                'deleted_files': sum(1 for info in self.file_history.values() if info.get('status') == 'DELETED'),
+                'moved_files': sum(1 for info in self.file_history.values() if info.get('status') == 'MOVED')
+            },
+            'file_types': self._get_file_type_stats(current_files)
+        }
         
-        # Detect changed files (need to check diff)
-        changed_files = set()
-        moved_files = set()
+        return report
+    
+    def _get_file_type_stats(self, files):
+        """
+        Get statistics about file types in the repository.
         
-        # Process diffs for each file
-        for file_data in commit_files:
-            file_path = file_data['path']
+        Args:
+            files (dict): Dictionary of current files
             
-            # Skip if file was just added
-            if file_path in added_files:
-                commit_stats['files_added'].append(file_path)
-                self.author_stats[author]['files_added'] += 1
-                continue
-                
-            # For existing files, get diff with previous commit
-            if previous_commit:
-                diff_text = self.get_file_diff(previous_commit['id'], commit_id, file_path)
-                lines_added, lines_removed = self.parse_diff(diff_text)
-                
-                # Update LOC stats
-                commit_stats['lines_added'] += lines_added
-                commit_stats['lines_removed'] += lines_removed
-                self.author_stats[author]['lines_added'] += lines_added
-                self.author_stats[author]['lines_removed'] += lines_removed
-                
-                # If file was changed but not added/deleted, it was modified
-                if file_path not in added_files and file_path not in deleted_files:
-                    # Check if it might be a move/rename
-                    # Simple heuristic: similar content but different path
-                    possible_moved_file = False
-                    # TODO: Implement a better heuristic for moved files
-                    
-                    if possible_moved_file:
-                        commit_stats['files_moved'].append(file_path)
-                        self.author_stats[author]['files_moved'] += 1
-                    else:
-                        commit_stats['files_modified'].append(file_path)
-                        self.author_stats[author]['files_modified'] += 1
-            
-        # Add deleted files to stats
-        for file_path in deleted_files:
-            commit_stats['files_deleted'].append(file_path)
-            self.author_stats[author]['files_deleted'] += 1
-            
-        logger.info(f"Commit {commit_id} analysis: {len(commit_stats['files_added'])} added, "
-                   f"{len(commit_stats['files_modified'])} modified, "
-                   f"{len(commit_stats['files_deleted'])} deleted, "
-                   f"{len(commit_stats['files_moved'])} moved, "
-                   f"{commit_stats['lines_added']} lines added, "
-                   f"{commit_stats['lines_removed']} lines removed")
-                   
-        return commit_stats
+        Returns:
+            dict: File type statistics
+        """
+        file_types = defaultdict(int)
+        
+        for path in files:
+            if '.' in path:
+                extension = path.split('.')[-1].lower()
+                file_types[extension] += 1
+            else:
+                file_types['no_extension'] += 1
+        
+        return dict(file_types)
 
-    def analyze_repository(self):
-        """Perform full repository analysis on initial and merge commits."""
-        logger.info("Starting repository analysis...")
-        
-        # Get important commits
-        important_commits = self.identify_important_commits()
-        if not important_commits:
-            logger.error("No commits found to analyze")
-            return False
-            
-        # Analysis results
-        analysis_results = []
-        
-        # Analyze each commit
-        previous_commit = None
-        for commit in important_commits:
-            logger.info(f"Analyzing commit {commit['id']} by {commit['author']['name']}")
-            
-            # Analyze this commit
-            commit_stats = self.analyze_commit(commit, previous_commit)
-            analysis_results.append(commit_stats)
-            
-            # Update previous commit for next iteration
-            previous_commit = commit
-            
-        # Save results
-        self.save_results(analysis_results)
-        
-        logger.info("Repository analysis completed")
-        return True
-        
-    def save_results(self, analysis_results):
-        """Save analysis results to files."""
-        # Save commit analysis as JSON
-        commits_file = os.path.join(self.output_dir, f"{self.project_key}_{self.repo_slug}_commits.json")
-        with open(commits_file, 'w') as f:
-            json.dump(analysis_results, f, indent=2)
-            
-        # Save author stats as CSV
-        authors_file = os.path.join(self.output_dir, f"{self.project_key}_{self.repo_slug}_authors.csv")
-        with open(authors_file, 'w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(['Author', 'Email', 'Commits', 'Files Added', 'Files Modified', 
-                            'Files Deleted', 'Files Moved', 'Lines Added', 'Lines Removed', 'Net LOC'])
-            
-            for commit in analysis_results:
-                author = commit['author']
-                email = commit['email']
-                # Check if we already have a row for this author
-                if not any(row[0] == author for row in csv.reader(open(authors_file))):
-                    stats = self.author_stats[author]
-                    net_loc = stats['lines_added'] - stats['lines_removed']
-                    writer.writerow([
-                        author, email, stats['commits'], stats['files_added'], 
-                        stats['files_modified'], stats['files_deleted'], stats['files_moved'],
-                        stats['lines_added'], stats['lines_removed'], net_loc
-                    ])
-                    
-        logger.info(f"Results saved to {self.output_dir} directory")
-        
 
 def main():
-    """Main function to run the Bitbucket repository analyzer."""
-    parser = argparse.ArgumentParser(description='Analyze Bitbucket repository commits')
+    """Main function to run the Bitbucket analyzer."""
+    parser = argparse.ArgumentParser(description='Analyze Bitbucket repository changes and author contributions')
     
     parser.add_argument('--server', required=True, help='Bitbucket server URL')
-    parser.add_argument('--username', required=True, help='Bitbucket username')
-    parser.add_argument('--password', required=True, help='Bitbucket password or token')
-    parser.add_argument('--project', required=True, help='Bitbucket project key')
+    parser.add_argument('--project', required=True, help='Project key')
     parser.add_argument('--repo', required=True, help='Repository slug')
-    parser.add_argument('--no-verify-ssl', action='store_true', help='Disable SSL verification')
-    parser.add_argument('--output-dir', default='output', help='Output directory')
+    parser.add_argument('--username', help='Bitbucket username')
+    parser.add_argument('--password', help='Bitbucket password or token')
+    parser.add_argument('--output', default='report.json', help='Output file name')
     
     args = parser.parse_args()
     
-    try:
-        analyzer = BitbucketAnalyzer(
-            server_url=args.server,
-            username=args.username,
-            password=args.password,
-            project_key=args.project,
-            repo_slug=args.repo,
-            verify_ssl=not args.no_verify_ssl,
-            output_dir=args.output_dir
+    # Set up authentication if provided
+    auth = None
+    if args.username and args.password:
+        auth = (args.username, args.password)
+    
+    # Create the analyzer
+    analyzer = BitbucketAnalyzer(
+        server_url=args.server,
+        project_key=args.project,
+        repository_slug=args.repo,
+        auth=auth
+    )
+    
+    # Get commits and analyze
+    commits = analyzer.get_commits()
+    if commits:
+        analyzer.analyze_changes(commits)
+        report = analyzer.generate_report()
+        
+        # Save the report
+        with open(args.output, 'w') as f:
+            json.dump(report, f, indent=2)
+        
+        print(f"Analysis complete! Report saved to {args.output}")
+        
+        # Print a summary to console
+        print("\nSummary:")
+        print(f"Repository: {report['repository']}")
+        print(f"Total files tracked: {report['file_counts']['total_files_ever']}")
+        print(f"Current files: {report['file_counts']['current_files']}")
+        print("\nTop contributors:")
+        
+        # Sort authors by lines of code contributed
+        sorted_authors = sorted(
+            report['author_stats'].items(),
+            key=lambda x: x[1]['lines_added'] + x[1]['lines_removed'],
+            reverse=True
         )
         
-        success = analyzer.analyze_repository()
-        
-        if success:
-            print(f"Analysis completed successfully. Results saved to {args.output_dir} directory.")
-            return 0
-        else:
-            print("Analysis failed. Check the logs for more information.")
-            return 1
-            
-    except Exception as e:
-        logger.error(f"Error during analysis: {e}", exc_info=True)
-        print(f"Error: {e}")
-        return 1
+        for author, stats in sorted_authors[:5]:  # Show top 5
+            total_lines = stats['lines_added'] + stats['lines_removed']
+            print(f"  {author}: {total_lines} lines ({stats['lines_added']} added, {stats['lines_removed']} removed)")
+
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
