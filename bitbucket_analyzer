@@ -596,7 +596,123 @@ class BitbucketAnalyzer:
         self.commits_analyzed += 1
         
         return commit_stats
+
+
+def new_analyze_repository(self, from_commit=None, to_commit=None):
+    """
+    Analyze the repository by moving sequentially through each commit pair in the history.
     
+    Args:
+        from_commit: Starting commit ID (optional)
+        to_commit: Ending commit ID (optional)
+        
+    Returns:
+        dict: Analysis results
+    """
+    # Get all commits
+    all_commits = self.get_all_commits(from_commit, to_commit)
+    if not all_commits:
+        print("No commits found to analyze.")
+        sys.exit(1)
+    
+    # Create a commit lookup dictionary for faster access
+    commit_dict = {commit['id']: commit for commit in all_commits}
+    
+    # Determine which commits to analyze
+    if self.only_significant:
+        # Get initial and merge commits
+        initial_commit = self.get_initial_commit(all_commits)
+        merge_commits = self.get_merge_commits(all_commits)
+        
+        # Create chronological list of significant commits
+        significant_commits = []
+        if initial_commit:
+            significant_commits.append(initial_commit)
+            print(f"Found initial commit: {initial_commit['id'][:8]}")
+        
+        if merge_commits:
+            # Sort merge commits chronologically
+            merge_commits.sort(key=lambda x: x.get('authorTimestamp', 0))
+            significant_commits.extend(merge_commits)
+            print(f"Found {len(merge_commits)} merge commits")
+        
+        # Filter the commit list to only significant commits
+        commits_to_process = significant_commits
+        print(f"Analyzing {len(commits_to_process)} significant commits")
+    else:
+        # Use all commits
+        commits_to_process = all_commits
+        print(f"Analyzing all {len(commits_to_process)} commits")
+    
+    # Sort commits by timestamp to ensure chronological order
+    commits_to_process.sort(key=lambda x: x.get('authorTimestamp', 0))
+    
+    # Initialize results
+    results = {
+        'repository': self.repo,
+        'branch': self.branch,
+        'analysis_date': datetime.now().isoformat(),
+        'commit_range': {
+            'from': from_commit,
+            'to': to_commit or self.branch
+        },
+        'total_commits': len(all_commits),
+        'analyzed_commits': len(commits_to_process),
+        'analyzed_types': 'significant' if self.only_significant else 'all',
+        'commits': []
+    }
+    
+    # Reset statistics
+    self.commits_analyzed = 0
+    
+    # Keep track of the last analyzed commit for significant commit mode
+    last_analyzed_commit = None
+    
+    # Process each commit in sequence
+    for i, commit in enumerate(commits_to_process):
+        commit_id = commit['id']
+        short_id = commit_id[:8]
+        print(f"Processing commit {i+1}/{len(commits_to_process)}: {short_id}")
+        
+        # Determine the parent commit to compare against
+        if self.only_significant and last_analyzed_commit:
+            # For significant commits, compare with the previous significant commit
+            compare_commit = last_analyzed_commit
+        else:
+            # For regular analysis, get the parent commit
+            parent_ids = [p.get('id') for p in commit.get('parents', [])]
+            if parent_ids:
+                # Use the first parent (main branch in case of merge)
+                compare_commit = commit_dict.get(parent_ids[0])
+            else:
+                # Initial commit has no parent
+                compare_commit = None
+        
+        # Analyze the commit pair
+        if compare_commit:
+            commit_analysis = self.analyze_commit_pair(commit, compare_commit)
+        else:
+            # For initial commit, compare with empty state
+            commit_analysis = self.analyze_commit_pair(commit, None)
+        
+        results['commits'].append(commit_analysis)
+        
+        # Update the last analyzed commit
+        last_analyzed_commit = commit
+    
+    # Prepare summary statistics
+    results['summary'] = {
+        'total': self.total_stats,
+        'files': dict(self.file_stats),
+        'authors': dict(self.author_stats),
+        'extensions': dict(self.extension_stats),
+        'directories': dict(self.directory_stats)
+    }
+    
+    print(f"Analysis complete. Processed {self.commits_analyzed} commits.")
+    return results
+
+
     def analyze_repository(self, from_commit=None, to_commit=None):
         """
         Analyze the repository - either all commits or only significant ones.
