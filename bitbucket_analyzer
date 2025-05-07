@@ -1,20 +1,13 @@
 #!/usr/bin/env python3
 """
-Bitbucket Change Analysis
+Bitbucket File-Based Change Analysis
 
-A focused script that correctly analyzes file changes and lines of code in each commit
-of a Bitbucket on-premise repository. This script uses Bitbucket Server API v1.0 to
-extract detailed statistics and produces cumulative results for all users.
-
-Features:
-- Accurate file change detection for each commit
-- Detailed LOC tracking (added, removed, modified) for each file
-- Cumulative statistics across all commits and users
-- Option to analyze only initial and merge commits
-- CSV export of detailed and summary statistics
+A script that analyzes commit changes in a Bitbucket on-premise repository using file-by-file diff
+operations. The script uses Bitbucket Server API v1.0 to extract detailed statistics about code
+changes between commits, correctly handling the file diff operations.
 
 Usage:
-    python bitbucket_change_analysis.py --repo PROJECT/REPO [options]
+    python bitbucket_file_analysis.py --repo PROJECT/REPO [options]
 
 Args:
     --repo: Repository in format PROJECT/REPO
@@ -43,7 +36,7 @@ from pathlib import Path
 from requests.auth import HTTPBasicAuth
 
 
-class BitbucketChangeAnalyzer:
+class BitbucketAnalyzer:
     def __init__(self, server, repo, branch='develop', auth=None, token=None, verbose=False, only_significant=False):
         """Initialize the analyzer with connection parameters."""
         self.server = server.rstrip('/')
@@ -107,11 +100,19 @@ class BitbucketChangeAnalyzer:
             'lines_modified': 0
         })
         
+        # Known binary file extensions
+        self.binary_extensions = {
+            'png', 'jpg', 'jpeg', 'gif', 'bmp', 'ico', 'pdf', 'zip', 'gz', 'tar',
+            'jar', 'war', 'ear', 'class', 'exe', 'dll', 'pdb', 'bin', 'obj', 'so',
+            'pyc', 'pyd', 'mp3', 'mp4', 'avi', 'mov', 'wmv', 'flv', 'woff', 'woff2',
+            'ttf', 'eot', 'svg', 'psd', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx'
+        }
+    
     def log(self, message):
         """Print log message if verbose mode is enabled."""
         if self.verbose:
             print(message)
-    
+            
     def make_request(self, url, method='GET', params=None, data=None):
         """Make an HTTP request to the Bitbucket API with error handling."""
         max_retries = 3
@@ -261,84 +262,78 @@ class BitbucketChangeAnalyzer:
         print(f"Total significant commits: {len(significant_commits)}")
         return significant_commits
     
-    def get_commit_changes(self, commit_id, parent_id=None):
+    def get_commit_files(self, commit_id):
         """
-        Get all files changed in a commit or between two commits.
+        Get list of all files in a commit.
         
         Args:
-            commit_id: Target commit ID
-            parent_id: Parent commit ID (optional)
+            commit_id: Commit ID
             
         Returns:
-            list: Changed file objects
+            list: List of file paths
         """
-        # If we have a parent commit ID, use the compare endpoint
-        if parent_id:
-            url = f"{self.api_base}/compare/changes"
-            params = {
-                'from': parent_id,
-                'to': commit_id,
-                'limit': 1000  # Use high limit to get all changes
-            }
-        else:
-            # Otherwise use the commit changes endpoint
-            url = f"{self.api_base}/commits/{commit_id}/changes"
-            params = {
-                'limit': 1000
-            }
+        url = f"{self.api_base}/commits/{commit_id}"
+        commit_data = self.make_request(url)
         
-        # Collect all changes with pagination
+        # Fetch files modified in this commit
+        changes_url = f"{self.api_base}/commits/{commit_id}/changes"
+        params = {'limit': 1000}  # Large limit to get all files
+        
         all_changes = []
         start = 0
         
         while True:
             params['start'] = start
-            response = self.make_request(url, params=params)
-            changes = response.get('values', [])
+            changes_data = self.make_request(changes_url, params=params)
             
-            if not changes:
+            if not changes_data.get('values'):
                 break
                 
-            all_changes.extend(changes)
+            all_changes.extend(changes_data.get('values', []))
             
-            if response.get('isLastPage', True):
+            if changes_data.get('isLastPage', True):
                 break
                 
-            start = response.get('nextPageStart')
-            
-        return all_changes
+            start = changes_data.get('nextPageStart')
+        
+        # Extract file paths
+        files = []
+        for change in all_changes:
+            path = change.get('path', {}).get('toString')
+            if path:
+                files.append({
+                    'path': path,
+                    'type': change.get('type')  # ADD, MODIFY, DELETE
+                })
+                
+        return files
     
-    def get_file_diff(self, commit_id, path, parent_id=None):
+    def get_file_diff(self, from_commit, to_commit, file_path):
         """
-        Get the diff for a specific file.
+        Get the diff for a specific file between two commits.
         
         Args:
-            commit_id: Target commit ID
-            path: File path
-            parent_id: Parent commit ID (optional)
+            from_commit: Source commit ID
+            to_commit: Target commit ID
+            file_path: Path to the file
             
         Returns:
             dict: Diff information
         """
         try:
-            if parent_id:
-                # If comparing with parent, use compare endpoint
-                url = f"{self.api_base}/compare/diff"
-                params = {
-                    'from': parent_id,
-                    'to': commit_id,
-                    'path': path
-                }
-            else:
-                # Otherwise use commit diff endpoint
-                url = f"{self.api_base}/commits/{commit_id}/diff/{path}"
-                params = {}
-                
+            # Use the compare/diff endpoint for comparing two commits
+            url = f"{self.api_base}/compare/diff"
+            params = {
+                'from': from_commit,
+                'to': to_commit,
+                'path': file_path
+            }
+            
             return self.make_request(url, params=params)
         except requests.exceptions.HTTPError as e:
             if hasattr(e, 'response') and e.response.status_code == 404:
                 # File not found or binary file
-                self.log(f"Warning: Could not get diff for file {path}")
+                self.log(f"Could not get diff for file {file_path}")
                 return None
             raise
     
@@ -380,29 +375,32 @@ class BitbucketChangeAnalyzer:
         
         return stats
     
-    def analyze_file(self, commit_id, file_info, file_type, parent_id=None):
+    def is_binary_file(self, file_path):
+        """Check if a file is likely binary based on extension."""
+        extension = Path(file_path).suffix.lower()[1:] if Path(file_path).suffix else ''
+        return extension in self.binary_extensions
+        
+    def analyze_file_change(self, file_info, from_commit, to_commit):
         """
-        Analyze a single file change.
+        Analyze changes to a specific file between two commits.
         
         Args:
-            commit_id: Commit ID
-            file_info: File change information from API
-            file_type: File change type (ADD, MODIFY, DELETE)
-            parent_id: Parent commit ID (optional)
+            file_info: File information (path and type)
+            from_commit: Source commit ID
+            to_commit: Target commit ID
             
         Returns:
             dict: File analysis results
         """
-        path = file_info.get('path', {}).get('toString', '')
-        if not path:
-            return None
-            
-        # Calculate path components
+        path = file_info['path']
+        file_type = file_info['type']
+        
+        # Extract file metadata
         path_obj = Path(path)
         extension = path_obj.suffix.lower()[1:] if path_obj.suffix else 'no_extension'
         directory = str(path_obj.parent).replace('\\', '/')
         
-        # Initialize result structure
+        # Initialize result
         result = {
             'path': path,
             'type': file_type,
@@ -415,9 +413,8 @@ class BitbucketChangeAnalyzer:
             }
         }
         
-        # For binary files or directories, use simple statistics
+        # For binary files, use simple statistics
         if self.is_binary_file(path):
-            # For binary files, count adds/removes but not line changes
             if file_type == 'ADD':
                 result['stats']['lines_added'] = 1
             elif file_type == 'DELETE':
@@ -425,56 +422,92 @@ class BitbucketChangeAnalyzer:
             elif file_type == 'MODIFY':
                 result['stats']['lines_modified'] = 1
         else:
-            # For text files, get detailed diff
-            diff = self.get_file_diff(commit_id, path, parent_id)
-            result['stats'] = self.analyze_file_diff(diff)
-            
+            # For text files, get the diff between commits
+            diff = self.get_file_diff(from_commit, to_commit, path)
+            if diff:
+                result['stats'] = self.analyze_file_diff(diff)
+        
         return result
     
-    def is_binary_file(self, path):
-        """Check if a file is likely binary based on extension."""
-        binary_extensions = {
-            'png', 'jpg', 'jpeg', 'gif', 'bmp', 'ico', 'pdf', 'zip', 
-            'tar', 'gz', 'jar', 'war', 'ear', 'class', 'exe', 'dll',
-            'pdb', 'bin', 'svg', 'woff', 'woff2', 'ttf', 'eot', 'mp3',
-            'mp4', 'avi', 'mov', 'wmv', 'flv', 'mkv', 'webm', 'ogg'
-        }
-        
-        extension = Path(path).suffix.lower()[1:] if Path(path).suffix else ''
-        return extension in binary_extensions
-    
-    def analyze_commit(self, commit):
+    def get_compare_changes(self, from_commit, to_commit):
         """
-        Analyze a single commit with file-by-file analysis.
+        Get file changes between two commits using the compare endpoint.
         
         Args:
-            commit: Commit information from API
+            from_commit: Source commit ID
+            to_commit: Target commit ID
             
         Returns:
-            dict: Commit analysis results
+            list: List of file changes
         """
-        commit_id = commit['id']
-        short_id = commit_id[:8]
+        url = f"{self.api_base}/compare/changes"
+        params = {
+            'from': from_commit,
+            'to': to_commit,
+            'limit': 1000
+        }
         
-        # Get parent commit ID for comparison
-        parent_id = None
-        if commit.get('parents'):
-            parent_id = commit.get('parents', [{}])[0].get('id')
+        all_changes = []
+        start = 0
+        
+        while True:
+            params['start'] = start
+            response = self.make_request(url, params=params)
             
-        self.log(f"Analyzing commit: {short_id}")
+            if not response.get('values'):
+                break
+                
+            all_changes.extend(response.get('values', []))
+            
+            if response.get('isLastPage', True):
+                break
+                
+            start = response.get('nextPageStart')
+            
+        # Convert to our format
+        files = []
+        for change in all_changes:
+            path = change.get('path', {}).get('toString')
+            if path:
+                files.append({
+                    'path': path,
+                    'type': change.get('type')  # ADD, MODIFY, DELETE
+                })
+                
+        return files
+    
+    def analyze_commit_pair(self, current_commit, previous_commit):
+        """
+        Analyze changes between two commits.
         
-        # Get changed files
-        changes = self.get_commit_changes(commit_id, parent_id)
+        Args:
+            current_commit: Current commit to analyze
+            previous_commit: Previous commit to compare with (can be None for initial commit)
+            
+        Returns:
+            dict: Analysis results
+        """
+        current_id = current_commit['id']
+        current_short_id = current_id[:8]
+        
+        # Get the previous commit ID if available
+        previous_id = previous_commit['id'] if previous_commit else None
+        previous_short_id = previous_id[:8] if previous_id else None
+        
+        self.log(f"Analyzing commit: {current_short_id}" + 
+                (f" (compared to {previous_short_id})" if previous_short_id else ""))
         
         # Initialize commit statistics
         commit_stats = {
-            'id': commit_id,
-            'short_id': short_id,
-            'author_name': commit.get('author', {}).get('name', 'Unknown'),
-            'author_email': commit.get('author', {}).get('emailAddress', 'Unknown'),
-            'date': datetime.fromtimestamp(commit.get('authorTimestamp', 0) / 1000).isoformat(),
-            'message': commit.get('message', ''),
-            'files_changed': len(changes),
+            'id': current_id,
+            'short_id': current_short_id,
+            'author_name': current_commit.get('author', {}).get('name', 'Unknown'),
+            'author_email': current_commit.get('author', {}).get('emailAddress', 'Unknown'),
+            'date': datetime.fromtimestamp(current_commit.get('authorTimestamp', 0) / 1000).isoformat(),
+            'message': current_commit.get('message', ''),
+            'compared_with': previous_id,
+            'compared_with_short': previous_short_id,
+            'files_changed': 0,
             'files_added': 0,
             'files_modified': 0,
             'files_deleted': 0,
@@ -484,29 +517,29 @@ class BitbucketChangeAnalyzer:
             'files': []
         }
         
-        # Author name for tracking
-        author_name = commit_stats['author_name']
-        
-        # Update author stats
-        self.author_stats[author_name]['commits'] += 1
-        
-        # Process each file
-        for change in changes:
-            file_type = change.get('type')
+        # Get file changes between the commits
+        if previous_id:
+            # If we have two commits to compare
+            changed_files = self.get_compare_changes(previous_id, current_id)
+        else:
+            # For the initial commit, get all files
+            changed_files = self.get_commit_files(current_id)
             
-            # Update file counts
+        commit_stats['files_changed'] = len(changed_files)
+        
+        # Counter for file types
+        for file_info in changed_files:
+            file_type = file_info['type']
             if file_type == 'ADD':
                 commit_stats['files_added'] += 1
             elif file_type == 'MODIFY':
                 commit_stats['files_modified'] += 1
             elif file_type == 'DELETE':
                 commit_stats['files_deleted'] += 1
-                
-            # Analyze file details
-            file_analysis = self.analyze_file(commit_id, change, parent_id)
-            if not file_analysis:
-                continue
-                
+        
+        # Process each file
+        for file_info in changed_files:
+            file_analysis = self.analyze_file_change(file_info, previous_id, current_id)
             commit_stats['files'].append(file_analysis)
             
             # Update line statistics
@@ -540,6 +573,8 @@ class BitbucketChangeAnalyzer:
             self.directory_stats[directory]['lines_modified'] += lines_modified
         
         # Update author statistics
+        author_name = commit_stats['author_name']
+        self.author_stats[author_name]['commits'] += 1
         self.author_stats[author_name]['files_changed'] += commit_stats['files_changed']
         self.author_stats[author_name]['files_added'] += commit_stats['files_added']
         self.author_stats[author_name]['files_modified'] += commit_stats['files_modified']
@@ -579,27 +614,27 @@ class BitbucketChangeAnalyzer:
             print("No commits found to analyze.")
             sys.exit(1)
         
-        # Filter to significant commits if requested
+        # Create a commit lookup dictionary
+        commit_dict = {commit['id']: commit for commit in all_commits}
+        
+        # Prepare commit pairs to analyze
         if self.only_significant:
-            significant_pairs = self.filter_significant_commits(all_commits)
-            if not significant_pairs:
-                print("No significant commits (initial or merge) found in the repository.")
-                sys.exit(1)
-            print(f"Analyzing {len(significant_pairs)} significant commits (initial + merge commits)")
-            
-            # For significant commits, we'll analyze pairs differently
-            commits_to_analyze = significant_pairs
-            analyzing_pairs = True
+            # For significant commits, get pairs with previous significant commit
+            commit_pairs = self.filter_significant_commits(all_commits)
+            print(f"Analyzing {len(commit_pairs)} significant commits (initial + merge commits)")
         else:
-            commits = all_commits
-            commits_to_analyze = [(commit, None) for commit in commits]  # Make compatible format
-            analyzing_pairs = False
-            print(f"Analyzing all {len(commits)} commits")
+            # For regular analysis, create pairs with direct parent
+            commit_pairs = []
+            for commit in all_commits:
+                parent_id = commit.get('parents', [{}])[0].get('id') if commit.get('parents') else None
+                parent_commit = commit_dict.get(parent_id) if parent_id else None
+                commit_pairs.append((commit, parent_commit))
+            print(f"Analyzing all {len(commit_pairs)} commits")
             
         # Reset statistics
         self.commits_analyzed = 0
         
-        # Initialize results structure
+        # Initialize results
         results = {
             'repository': self.repo,
             'branch': self.branch,
@@ -609,23 +644,15 @@ class BitbucketChangeAnalyzer:
                 'to': to_commit or self.branch
             },
             'total_commits': len(all_commits),
-            'analyzed_commits': len(commits_to_analyze),
+            'analyzed_commits': len(commit_pairs),
             'analyzed_types': 'significant' if self.only_significant else 'all',
             'commits': []
         }
         
-        # Process each commit or commit pair
-        for i, (commit, previous_significant) in enumerate(commits_to_analyze):
-            if analyzing_pairs and previous_significant:
-                print(f"Processing significant commit {i+1}/{len(commits_to_analyze)}: {commit['id'][:8]} " + 
-                     f"(comparing with previous: {previous_significant['id'][:8]})")
-                # When analyzing significant commits, we want all changes since the previous significant commit
-                commit_analysis = self.analyze_commit(commit, comparison_commit=previous_significant)
-            else:
-                # For regular analysis or the initial commit
-                print(f"Processing commit {i+1}/{len(commits_to_analyze)}: {commit['id'][:8]}")
-                commit_analysis = self.analyze_commit(commit)
-                
+        # Process each commit pair
+        for i, (commit, parent_commit) in enumerate(commit_pairs):
+            print(f"Processing commit {i+1}/{len(commit_pairs)}: {commit['id'][:8]}")
+            commit_analysis = self.analyze_commit_pair(commit, parent_commit)
             results['commits'].append(commit_analysis)
         
         # Prepare summary statistics
@@ -694,61 +721,7 @@ class BitbucketChangeAnalyzer:
                 })
         print(f"Author statistics saved to: {authors_csv}")
         
-        # Export cumulative statistics CSV
-        stats_csv = os.path.join(output_dir, f"{repo_name}_{timestamp}_stats.csv")
-        with open(stats_csv, 'w', newline='', encoding='utf-8') as f:
-            fieldnames = ['category', 'files_changed', 'files_added', 'files_modified', 
-                         'files_deleted', 'lines_added', 'lines_removed', 
-                         'lines_modified', 'net_change']
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            
-            # Write total stats
-            total = results['summary']['total']
-            writer.writerow({
-                'category': 'Total',
-                'files_changed': total['files_changed'],
-                'files_added': total['files_added'],
-                'files_modified': total['files_modified'],
-                'files_deleted': total['files_deleted'],
-                'lines_added': total['lines_added'],
-                'lines_removed': total['lines_removed'],
-                'lines_modified': total['lines_modified'],
-                'net_change': total['lines_added'] - total['lines_removed']
-            })
-            
-            # Write extension stats
-            for ext, stats in sorted(results['summary']['extensions'].items(), 
-                                    key=lambda x: x[1]['files'], reverse=True):
-                writer.writerow({
-                    'category': f"Extension: {ext}",
-                    'files_changed': stats['files'],
-                    'files_added': '',  # Not tracked per extension
-                    'files_modified': '',
-                    'files_deleted': '',
-                    'lines_added': stats['lines_added'],
-                    'lines_removed': stats['lines_removed'],
-                    'lines_modified': stats['lines_modified'],
-                    'net_change': stats['lines_added'] - stats['lines_removed']
-                })
-                
-            # Write directory stats
-            for directory, stats in sorted(results['summary']['directories'].items(), 
-                                         key=lambda x: x[1]['files'], reverse=True):
-                writer.writerow({
-                    'category': f"Directory: {directory}",
-                    'files_changed': stats['files'],
-                    'files_added': '',  # Not tracked per directory
-                    'files_modified': '',
-                    'files_deleted': '',
-                    'lines_added': stats['lines_added'],
-                    'lines_removed': stats['lines_removed'],
-                    'lines_modified': stats['lines_modified'],
-                    'net_change': stats['lines_added'] - stats['lines_removed']
-                })
-        print(f"Overall statistics saved to: {stats_csv}")
-        
-        # Export most changed files CSV
+        # Export file statistics CSV
         files_csv = os.path.join(output_dir, f"{repo_name}_{timestamp}_files.csv")
         with open(files_csv, 'w', newline='', encoding='utf-8') as f:
             fieldnames = ['path', 'changes', 'lines_added', 'lines_removed', 
@@ -806,7 +779,7 @@ def main():
         auth = HTTPBasicAuth(args.username, password)
     
     # Create analyzer
-    analyzer = BitbucketChangeAnalyzer(
+    analyzer = BitbucketAnalyzer(
         server=args.server,
         repo=args.repo,
         branch=args.branch,
