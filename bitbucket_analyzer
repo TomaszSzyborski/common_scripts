@@ -226,31 +226,39 @@ class BitbucketChangeAnalyzer:
         
     def filter_significant_commits(self, commits):
         """
-        Filter commits to include only initial and merge commits.
+        Filter commits to include only initial and merge commits, and
+        establish commit history tracking to analyze changes between significant points.
         
         Args:
             commits: List of all commit objects
             
         Returns:
-            list: Filtered list of significant commits
+            list: A list containing tuples of (commit, previous_significant_commit) pairs
         """
         significant_commits = []
+        previous_significant = None
         
-        # Add initial commit
+        # First, get initial commit
         initial_commit = self.get_initial_commit(commits)
         if initial_commit:
-            significant_commits.append(initial_commit)
+            # Initial commit has no previous significant commit
+            significant_commits.append((initial_commit, None))
+            previous_significant = initial_commit
             print(f"Found initial commit: {initial_commit['id'][:8]}")
         
-        # Add merge commits
+        # Then find all merge commits
         merge_commits = self.get_merge_commits(commits)
         if merge_commits:
-            significant_commits.extend(merge_commits)
+            # Sort merge commits chronologically
+            merge_commits.sort(key=lambda x: x.get('authorTimestamp', 0))
             print(f"Found {len(merge_commits)} merge commits")
             
-        # Ensure commits are sorted chronologically
-        significant_commits.sort(key=lambda x: x.get('authorTimestamp', 0))
+            # Add each merge commit with its previous significant commit reference
+            for merge_commit in merge_commits:
+                significant_commits.append((merge_commit, previous_significant))
+                previous_significant = merge_commit
         
+        print(f"Total significant commits: {len(significant_commits)}")
         return significant_commits
     
     def get_commit_changes(self, commit_id, parent_id=None):
@@ -372,13 +380,14 @@ class BitbucketChangeAnalyzer:
         
         return stats
     
-    def analyze_file(self, commit_id, file_info, parent_id=None):
+    def analyze_file(self, commit_id, file_info, file_type, parent_id=None):
         """
         Analyze a single file change.
         
         Args:
             commit_id: Commit ID
             file_info: File change information from API
+            file_type: File change type (ADD, MODIFY, DELETE)
             parent_id: Parent commit ID (optional)
             
         Returns:
@@ -388,8 +397,7 @@ class BitbucketChangeAnalyzer:
         if not path:
             return None
             
-        # Get file type and calculate path components
-        file_type = file_info.get('type')
+        # Calculate path components
         path_obj = Path(path)
         extension = path_obj.suffix.lower()[1:] if path_obj.suffix else 'no_extension'
         directory = str(path_obj.parent).replace('\\', '/')
@@ -573,13 +581,19 @@ class BitbucketChangeAnalyzer:
         
         # Filter to significant commits if requested
         if self.only_significant:
-            commits = self.filter_significant_commits(all_commits)
-            if not commits:
+            significant_pairs = self.filter_significant_commits(all_commits)
+            if not significant_pairs:
                 print("No significant commits (initial or merge) found in the repository.")
                 sys.exit(1)
-            print(f"Analyzing {len(commits)} significant commits (initial + merge commits)")
+            print(f"Analyzing {len(significant_pairs)} significant commits (initial + merge commits)")
+            
+            # For significant commits, we'll analyze pairs differently
+            commits_to_analyze = significant_pairs
+            analyzing_pairs = True
         else:
             commits = all_commits
+            commits_to_analyze = [(commit, None) for commit in commits]  # Make compatible format
+            analyzing_pairs = False
             print(f"Analyzing all {len(commits)} commits")
             
         # Reset statistics
@@ -595,15 +609,23 @@ class BitbucketChangeAnalyzer:
                 'to': to_commit or self.branch
             },
             'total_commits': len(all_commits),
-            'analyzed_commits': len(commits),
+            'analyzed_commits': len(commits_to_analyze),
             'analyzed_types': 'significant' if self.only_significant else 'all',
             'commits': []
         }
         
-        # Process each commit
-        for i, commit in enumerate(commits):
-            print(f"Processing commit {i+1}/{len(commits)}: {commit['id'][:8]}")
-            commit_analysis = self.analyze_commit(commit)
+        # Process each commit or commit pair
+        for i, (commit, previous_significant) in enumerate(commits_to_analyze):
+            if analyzing_pairs and previous_significant:
+                print(f"Processing significant commit {i+1}/{len(commits_to_analyze)}: {commit['id'][:8]} " + 
+                     f"(comparing with previous: {previous_significant['id'][:8]})")
+                # When analyzing significant commits, we want all changes since the previous significant commit
+                commit_analysis = self.analyze_commit(commit, comparison_commit=previous_significant)
+            else:
+                # For regular analysis or the initial commit
+                print(f"Processing commit {i+1}/{len(commits_to_analyze)}: {commit['id'][:8]}")
+                commit_analysis = self.analyze_commit(commit)
+                
             results['commits'].append(commit_analysis)
         
         # Prepare summary statistics
