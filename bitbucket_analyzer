@@ -10,6 +10,7 @@ Features:
 - Accurate file change detection for each commit
 - Detailed LOC tracking (added, removed, modified) for each file
 - Cumulative statistics across all commits and users
+- Option to analyze only initial and merge commits
 - CSV export of detailed and summary statistics
 
 Usage:
@@ -25,6 +26,7 @@ Args:
     --output: Output directory for results (default: current directory)
     --from-commit: Starting commit ID (optional)
     --to-commit: Ending commit ID (optional)
+    --only-significant: Analyze only initial and merge commits
     --verbose: Show detailed progress information
 """
 
@@ -42,7 +44,7 @@ from requests.auth import HTTPBasicAuth
 
 
 class BitbucketChangeAnalyzer:
-    def __init__(self, server, repo, branch='develop', auth=None, token=None, verbose=False):
+    def __init__(self, server, repo, branch='develop', auth=None, token=None, verbose=False, only_significant=False):
         """Initialize the analyzer with connection parameters."""
         self.server = server.rstrip('/')
         self.repo = repo
@@ -50,6 +52,7 @@ class BitbucketChangeAnalyzer:
         self.auth = auth
         self.token = token
         self.verbose = verbose
+        self.only_significant = only_significant
         self.headers = {'Accept': 'application/json'}
         
         if token:
@@ -190,6 +193,65 @@ class BitbucketChangeAnalyzer:
         
         print(f"Found {len(commits)} commits")
         return commits
+        
+    def get_initial_commit(self, commits):
+        """
+        Find the initial commit of the repository.
+        
+        Args:
+            commits: List of commit objects
+            
+        Returns:
+            dict: Initial commit object or None
+        """
+        if not commits:
+            return None
+            
+        # Sort by timestamp to find the earliest commit
+        sorted_commits = sorted(commits, key=lambda x: x.get('authorTimestamp', 0))
+        return sorted_commits[0]
+        
+    def get_merge_commits(self, commits):
+        """
+        Find all merge commits in the repository.
+        
+        Args:
+            commits: List of commit objects
+            
+        Returns:
+            list: List of merge commit objects
+        """
+        # Merge commits have more than one parent
+        return [commit for commit in commits if len(commit.get('parents', [])) > 1]
+        
+    def filter_significant_commits(self, commits):
+        """
+        Filter commits to include only initial and merge commits.
+        
+        Args:
+            commits: List of all commit objects
+            
+        Returns:
+            list: Filtered list of significant commits
+        """
+        significant_commits = []
+        
+        # Add initial commit
+        initial_commit = self.get_initial_commit(commits)
+        if initial_commit:
+            significant_commits.append(initial_commit)
+            print(f"Found initial commit: {initial_commit['id'][:8]}")
+        
+        # Add merge commits
+        merge_commits = self.get_merge_commits(commits)
+        if merge_commits:
+            significant_commits.extend(merge_commits)
+            print(f"Found {len(merge_commits)} merge commits")
+            
+        # Ensure commits are sorted chronologically
+        significant_commits.sort(key=lambda x: x.get('authorTimestamp', 0))
+        
+        return significant_commits
     
     def get_commit_changes(self, commit_id, parent_id=None):
         """
@@ -494,7 +556,7 @@ class BitbucketChangeAnalyzer:
     
     def analyze_repository(self, from_commit=None, to_commit=None):
         """
-        Analyze the entire repository.
+        Analyze the repository - either all commits or only significant ones.
         
         Args:
             from_commit: Starting commit ID (optional)
@@ -504,10 +566,21 @@ class BitbucketChangeAnalyzer:
             dict: Analysis results
         """
         # Get all commits
-        commits = self.get_all_commits(from_commit, to_commit)
-        if not commits:
+        all_commits = self.get_all_commits(from_commit, to_commit)
+        if not all_commits:
             print("No commits found to analyze.")
             sys.exit(1)
+        
+        # Filter to significant commits if requested
+        if self.only_significant:
+            commits = self.filter_significant_commits(all_commits)
+            if not commits:
+                print("No significant commits (initial or merge) found in the repository.")
+                sys.exit(1)
+            print(f"Analyzing {len(commits)} significant commits (initial + merge commits)")
+        else:
+            commits = all_commits
+            print(f"Analyzing all {len(commits)} commits")
             
         # Reset statistics
         self.commits_analyzed = 0
@@ -521,7 +594,9 @@ class BitbucketChangeAnalyzer:
                 'from': from_commit,
                 'to': to_commit or self.branch
             },
-            'total_commits': len(commits),
+            'total_commits': len(all_commits),
+            'analyzed_commits': len(commits),
+            'analyzed_types': 'significant' if self.only_significant else 'all',
             'commits': []
         }
         
@@ -688,6 +763,8 @@ def parse_arguments():
     parser.add_argument('--output', default='.', help='Output directory for results')
     parser.add_argument('--from-commit', help='Starting commit ID for analysis')
     parser.add_argument('--to-commit', help='Ending commit ID for analysis')
+    parser.add_argument('--only-significant', action='store_true', 
+                       help='Analyze only initial and merge commits')
     parser.add_argument('--verbose', action='store_true', help='Show detailed progress info')
     
     return parser.parse_args()
@@ -713,7 +790,8 @@ def main():
         branch=args.branch,
         auth=auth,
         token=args.token,
-        verbose=args.verbose
+        verbose=args.verbose,
+        only_significant=args.only_significant
     )
     
     # Run analysis
@@ -730,7 +808,13 @@ def main():
     print("\n=== Analysis Summary ===")
     print(f"Repository: {results['repository']}")
     print(f"Branch: {results['branch']}")
-    print(f"Total commits analyzed: {results['total_commits']}")
+    print(f"Total commits: {results['total_commits']}")
+    
+    if args.only_significant:
+        print(f"Analyzed commits: {results['analyzed_commits']} (initial + merge commits only)")
+    else:
+        print(f"Analyzed commits: {results['analyzed_commits']} (all commits)")
+        
     print(f"Files changed: {total['files_changed']}")
     print(f"  - Files added: {total['files_added']}")
     print(f"  - Files modified: {total['files_modified']}")
