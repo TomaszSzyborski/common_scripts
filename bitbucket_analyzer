@@ -155,6 +155,66 @@ class BitbucketClient:
         
         logger.info(f"Retrieved {len(all_changes)} changes between commits")
         return all_changes
+        
+    def get_file_content(self, commit_id: str, file_path: str) -> str:
+        """
+        Get the content of a file at a specific commit.
+        
+        Args:
+            commit_id (str): The commit ID
+            file_path (str): The path to the file
+            
+        Returns:
+            str: The content of the file
+            
+        Raises:
+            Exception: If the file cannot be retrieved
+        """
+        endpoint = f"/browse/{file_path}"
+        params = {"at": commit_id, "raw": "true"}
+        
+        logger.debug(f"Fetching content of file: {file_path} at commit: {commit_id[:7]}")
+        
+        try:
+            url = f"{self.api_base}{endpoint}"
+            response = requests.get(url, auth=self.auth, params=params)
+            response.raise_for_status()
+            return response.text
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to get file content: {e}")
+            return f"Error: Could not retrieve file content - {str(e)}"
+            
+    def get_file_diff(self, current_commit_id: str, previous_commit_id: str, file_path: str) -> str:
+        """
+        Get the diff of a file between two commits.
+        
+        Args:
+            current_commit_id (str): The current commit ID
+            previous_commit_id (str): The previous commit ID
+            file_path (str): The path to the file
+            
+        Returns:
+            str: The diff of the file
+            
+        Raises:
+            Exception: If the diff cannot be retrieved
+        """
+        endpoint = f"/diff/{file_path}"
+        params = {
+            "until": current_commit_id,
+            "since": previous_commit_id
+        }
+        
+        logger.debug(f"Fetching diff of file: {file_path} between commits: {previous_commit_id[:7]} and {current_commit_id[:7]}")
+        
+        try:
+            url = f"{self.api_base}{endpoint}"
+            response = requests.get(url, auth=self.auth, params=params)
+            response.raise_for_status()
+            return response.text
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to get file diff: {e}")
+            return f"Error: Could not retrieve file diff - {str(e)}"
 
 
 class CommitAnalyzer:
@@ -272,7 +332,8 @@ class CommitAnalyzer:
                 "net_change": 0,
                 "files_changed": 0,
                 "is_initial": True,
-                "is_merge": False
+                "is_merge": False,
+                "file_changes": []
             }
         
         # Get changes between commits
@@ -282,6 +343,7 @@ class CommitAnalyzer:
         lines_added = 0
         lines_removed = 0
         files_changed = 0
+        file_changes = []
         
         # Process each changed file
         for change in changes:
@@ -292,19 +354,50 @@ class CommitAnalyzer:
                 
             files_changed += 1
             
+            # Initialize file change info
+            file_change_info = {
+                "path": change.get("path", "Unknown"),
+                "type": change.get("type", "Unknown"),
+                "lines_added": 0,
+                "lines_removed": 0,
+                "net_change": 0,
+                "src_executable": change.get("srcExecutable", False),
+                "executable": change.get("executable", False)
+            }
+            
             # Extract line counts from the change
             if "type" in change:
                 if change["type"] == "ADD":
                     # New file - all lines are added
-                    lines_added += change.get("linesAdded", 0) or 0
+                    file_added_lines = change.get("linesAdded", 0) or 0
+                    lines_added += file_added_lines
+                    file_change_info["lines_added"] = file_added_lines
                 elif change["type"] == "DELETE":
                     # Deleted file - all lines are removed
-                    lines_removed += change.get("linesRemoved", 0) or 0
+                    file_removed_lines = change.get("linesRemoved", 0) or 0
+                    lines_removed += file_removed_lines
+                    file_change_info["lines_removed"] = file_removed_lines
                 elif change["type"] == "MODIFY":
                     # Modified file - both additions and removals
-                    lines_added += change.get("linesAdded", 0) or 0
-                    lines_removed += change.get("linesRemoved", 0) or 0
+                    file_added_lines = change.get("linesAdded", 0) or 0
+                    file_removed_lines = change.get("linesRemoved", 0) or 0
+                    lines_added += file_added_lines
+                    lines_removed += file_removed_lines
+                    file_change_info["lines_added"] = file_added_lines
+                    file_change_info["lines_removed"] = file_removed_lines
                 # There's also MOVE and COPY, but they don't directly affect line counts
+            
+            # Calculate net change for this file
+            file_change_info["net_change"] = file_change_info["lines_added"] - file_change_info["lines_removed"]
+            
+            # Add additional metadata if available
+            if "nodeType" in change:
+                file_change_info["node_type"] = change["nodeType"]
+            if "percentUnchanged" in change:
+                file_change_info["percent_unchanged"] = change["percentUnchanged"]
+            
+            # Add to the list of file changes
+            file_changes.append(file_change_info)
         
         # Calculate net change
         net_change = lines_added - lines_removed
@@ -321,7 +414,8 @@ class CommitAnalyzer:
             "net_change": net_change,
             "files_changed": files_changed,
             "is_initial": self.is_initial_commit(current_commit),
-            "is_merge": self.is_merge_commit(current_commit)
+            "is_merge": self.is_merge_commit(current_commit),
+            "file_changes": file_changes
         }
     
     def analyze_branch(self, branch: str, excluded_extensions: List[str] = None) -> List[Dict]:
@@ -389,12 +483,14 @@ class Reporter:
         return dt.strftime("%Y-%m-%d %H:%M:%S")
     
     @staticmethod
-    def generate_text_report(analysis_results: List[Dict]) -> str:
+    def generate_text_report(analysis_results: List[Dict], show_files: bool = True, show_cumulative: bool = True) -> str:
         """
         Generate a text report from commit analysis results.
         
         Args:
             analysis_results (List[Dict]): List of commit analysis results
+            show_files (bool, optional): Whether to show detailed file changes
+            show_cumulative (bool, optional): Whether to show cumulative changes
             
         Returns:
             str: Formatted text report
@@ -404,8 +500,20 @@ class Reporter:
         
         report_lines = ["Bitbucket Commit Analysis Report", "=" * 30, ""]
         
+        # Initialize cumulative counters
+        cumulative_added = 0
+        cumulative_removed = 0
+        cumulative_net = 0
+        cumulative_files = 0
+        
         for result in analysis_results:
             commit_type = "Initial Commit" if result["is_initial"] else "Merge Commit"
+            
+            # Update cumulative counters
+            cumulative_added += result["lines_added"]
+            cumulative_removed += result["lines_removed"]
+            cumulative_net += result["net_change"]
+            cumulative_files += result["files_changed"]
             
             report_lines.append(f"Commit: {result['commit_id'][:7]} ({commit_type})")
             report_lines.append(f"Author: {result['author']}")
@@ -415,7 +523,38 @@ class Reporter:
             report_lines.append(f"Lines Added: {result['lines_added']}")
             report_lines.append(f"Lines Removed: {result['lines_removed']}")
             report_lines.append(f"Net Change: {result['net_change']}")
-            report_lines.append("-" * 30)
+            
+            # Show cumulative changes if requested
+            if show_cumulative:
+                report_lines.append(f"Cumulative Files Changed: {cumulative_files}")
+                report_lines.append(f"Cumulative Lines Added: {cumulative_added}")
+                report_lines.append(f"Cumulative Lines Removed: {cumulative_removed}")
+                report_lines.append(f"Cumulative Net Change: {cumulative_net}")
+            
+            # Show detailed file changes if requested and available
+            if show_files and "file_changes" in result and result["file_changes"]:
+                report_lines.append("")
+                report_lines.append("File Changes:")
+                report_lines.append("-" * 20)
+                
+                # Sort files by most changes (absolute value of net change)
+                sorted_files = sorted(
+                    result["file_changes"], 
+                    key=lambda x: abs(x["net_change"]), 
+                    reverse=True
+                )
+                
+                for file_change in sorted_files:
+                    change_type = file_change["type"]
+                    path = file_change["path"]
+                    added = file_change["lines_added"]
+                    removed = file_change["lines_removed"]
+                    net = file_change["net_change"]
+                    
+                    report_lines.append(f"  {path} ({change_type})")
+                    report_lines.append(f"    +{added} -{removed} (net: {net:+d})")
+            
+            report_lines.append("-" * 60)
             report_lines.append("")
         
         # Add summary
@@ -435,12 +574,13 @@ class Reporter:
         return "\n".join(report_lines)
     
     @staticmethod
-    def generate_json_report(analysis_results: List[Dict]) -> str:
+    def generate_json_report(analysis_results: List[Dict], show_cumulative: bool = True) -> str:
         """
         Generate a JSON report from commit analysis results.
         
         Args:
             analysis_results (List[Dict]): List of commit analysis results
+            show_cumulative (bool, optional): Whether to include cumulative changes
             
         Returns:
             str: JSON formatted report
@@ -456,6 +596,26 @@ class Reporter:
             "total_lines_removed": sum(r["lines_removed"] for r in analysis_results),
             "total_net_change": sum(r["net_change"] for r in analysis_results)
         }
+        
+        # Add cumulative data if requested
+        if show_cumulative:
+            cumulative_added = 0
+            cumulative_removed = 0
+            cumulative_net = 0
+            cumulative_files = 0
+            
+            for result in analysis_results:
+                # Update cumulative values
+                cumulative_added += result["lines_added"]
+                cumulative_removed += result["lines_removed"]
+                cumulative_net += result["net_change"]
+                cumulative_files += result["files_changed"]
+                
+                # Add cumulative data to the result
+                result["cumulative_files_changed"] = cumulative_files
+                result["cumulative_lines_added"] = cumulative_added
+                result["cumulative_lines_removed"] = cumulative_removed
+                result["cumulative_net_change"] = cumulative_net
         
         # Format the results
         report_data = {
@@ -482,6 +642,11 @@ def main():
     parser.add_argument("--output", help="Output file (if not specified, prints to stdout)")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
     parser.add_argument("--exclude", nargs="+", help="File extensions to exclude (e.g., .jpg .png)")
+    parser.add_argument("--no-files", action="store_true", help="Don't show individual file changes in the report")
+    parser.add_argument("--file-details", action="store_true", help="Get detailed information for each file (slower)")
+    parser.add_argument("--file-content", action="store_true", help="Include file content in the report (JSON only)")
+    parser.add_argument("--no-cumulative", action="store_true", 
+                        help="Don't include cumulative changes in the report")
     
     args = parser.parse_args()
     
@@ -511,11 +676,16 @@ def main():
         # Analyze the branch
         results = analyzer.analyze_branch(args.branch, excluded_extensions)
         
+        # Determine if cumulative changes should be shown
+        show_cumulative = not args.no_cumulative
+        
         # Generate the report
         if args.format == "json":
-            report = Reporter.generate_json_report(results)
+            report = Reporter.generate_json_report(results, show_cumulative)
         else:
-            report = Reporter.generate_text_report(results)
+            # Only show file details in text report if requested
+            show_files = not args.no_files
+            report = Reporter.generate_text_report(results, show_files, show_cumulative)
         
         # Output the report
         if args.output:
