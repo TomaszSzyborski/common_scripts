@@ -1,450 +1,533 @@
-import requests
-import json
-from collections import defaultdict
-from datetime import datetime
+#!/usr/bin/env python3
+"""
+Bitbucket Commit Analyzer
+
+This script analyzes commits in a Bitbucket branch, focusing on initial and merge commits.
+It reports statistics for each commit including author, lines added/removed, and net change.
+"""
+
 import argparse
 import logging
+import sys
+import os
+import requests
+from requests.auth import HTTPBasicAuth
+from typing import Dict, List, Tuple, Optional, Any
+import json
+from datetime import datetime
 
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("bitbucket_analyzer.log"),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
 
-class BitbucketAnalyzer:
+logger = logging.getLogger("BitbucketAnalyzer")
+
+class BitbucketClient:
     """
-    A class to analyze Bitbucket repositories, focusing on merge commits
-    to track file changes and author contributions.
+    Client for interacting with the Bitbucket on-premise server API.
+    
+    This class handles all API communication including authentication and error handling.
     """
     
-    def __init__(self, server_url, project_key, repository_slug, auth=None):
+    def __init__(self, base_url: str, project: str, repository: str, username: str, password: str):
         """
-        Initialize the BitbucketAnalyzer with server and repo information.
+        Initialize the Bitbucket client.
         
         Args:
-            server_url (str): The Bitbucket server URL
-            project_key (str): The project key
-            repository_slug (str): The repository slug
-            auth (tuple, optional): Basic auth tuple (username, password/token)
+            base_url (str): The base URL of the Bitbucket server, e.g., 'https://bitbucket.example.com'
+            project (str): The Bitbucket project key
+            repository (str): The repository name
+            username (str): Username for Bitbucket authentication
+            password (str): Password or token for Bitbucket authentication
         """
-        self.server_url = server_url.rstrip('/')
-        self.project_key = project_key
-        self.repository_slug = repository_slug
-        self.auth = auth
-        self.base_url = f"{self.server_url}/rest/api/latest/projects/{self.project_key}/repos/{self.repository_slug}"
-        self.session = requests.Session()
+        self.base_url = base_url.rstrip('/')
+        self.project = project
+        self.repository = repository
+        self.auth = HTTPBasicAuth(username, password)
+        self.api_base = f"{self.base_url}/rest/api/1.0/projects/{project}/repos/{repository}"
+        logger.info(f"Initialized BitbucketClient for {project}/{repository}")
         
-        if auth:
-            self.session.auth = auth
-            
-        # Data tracking
-        self.authors = defaultdict(lambda: {
-            'commits': 0,
-            'lines_added': 0,
-            'lines_removed': 0,
-            'files_added': 0,
-            'files_removed': 0,
-            'files_modified': 0
-        })
-        self.file_history = {}
-        
-        # Set up logging
-        logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s - %(levelname)s - %(message)s'
-        )
-        self.logger = logging.getLogger('BitbucketAnalyzer')
-    
-    def get_commits(self):
+    def _make_request(self, endpoint: str, params: Dict = None) -> Dict:
         """
-        Get all commits from the repository, focusing on initial commit and merge commits.
-        
-        Returns:
-            list: A list of commit objects
-        """
-        self.logger.info(f"Fetching commits for {self.project_key}/{self.repository_slug}")
-        
-        # First, get the initial commit
-        initial_commit = self._get_initial_commit()
-        if not initial_commit:
-            self.logger.error("Could not find initial commit")
-            return []
-            
-        # Then get all merge commits
-        merge_commits = self._get_merge_commits()
-        
-        # Create the final ordered list starting with initial commit
-        commits = [initial_commit] + merge_commits
-        
-        self.logger.info(f"Found {len(commits)} commits (initial + {len(merge_commits)} merge commits)")
-        return commits
-    
-    def _get_initial_commit(self):
-        """
-        Get the initial commit of the repository.
-        
-        Returns:
-            dict: The initial commit object
-        """
-        url = f"{self.base_url}/commits"
-        params = {
-            'until': 'master',
-            'order': 'OLDEST',
-            'limit': 1
-        }
-        
-        response = self.session.get(url, params=params)
-        
-        if response.status_code == 200:
-            data = response.json()
-            if data.get('values') and len(data['values']) > 0:
-                return data['values'][0]
-        
-        self.logger.error(f"Error fetching initial commit: {response.status_code}")
-        return None
-    
-    def _get_merge_commits(self):
-        """
-        Get all merge commits in the repository.
-        
-        Returns:
-            list: A list of merge commit objects
-        """
-        merge_commits = []
-        url = f"{self.base_url}/commits"
-        params = {
-            'merges': 'only',
-            'limit': 100,
-            'start': 0
-        }
-        
-        while True:
-            response = self.session.get(url, params=params)
-            
-            if response.status_code != 200:
-                self.logger.error(f"Error fetching merge commits: {response.status_code}")
-                break
-            
-            data = response.json()
-            values = data.get('values', [])
-            
-            if not values:
-                break
-                
-            merge_commits.extend(values)
-            
-            # Check if there are more commits to fetch
-            is_last_page = data.get('isLastPage', True)
-            if is_last_page:
-                break
-                
-            params['start'] = data.get('nextPageStart', 0)
-        
-        # Sort commits by date (oldest first)
-        merge_commits.sort(key=lambda c: datetime.strptime(c.get('authorTimestamp', 0) / 1000, '%Y-%m-%d %H:%M:%S'))
-        
-        return merge_commits
-    
-    def analyze_changes(self, commits):
-        """
-        Analyze changes between successive commits and gather statistics.
+        Make an API request to Bitbucket.
         
         Args:
-            commits (list): List of commit objects to analyze
-        """
-        self.logger.info("Analyzing changes between commits")
-        
-        # Process each commit in order
-        for i, current_commit in enumerate(commits):
-            # Skip the first commit (it doesn't have a parent to compare to)
-            if i == 0:
-                self._process_initial_commit(current_commit)
-                continue
-                
-            # Get the previous commit to compare against
-            previous_commit = commits[i-1]
+            endpoint (str): The API endpoint to call
+            params (Dict, optional): Query parameters to include in the request
             
-            self._analyze_commit_changes(current_commit, previous_commit)
-    
-    def _process_initial_commit(self, commit):
+        Returns:
+            Dict: The JSON response from the API
+            
+        Raises:
+            Exception: If the API call fails
         """
-        Process the initial commit, tracking all files as "added".
+        url = f"{self.api_base}{endpoint}"
+        logger.debug(f"Making API request to: {url}")
+        
+        try:
+            response = requests.get(url, auth=self.auth, params=params)
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            logger.error(f"API request failed: {e}")
+            raise Exception(f"Failed to make API request: {e}")
+    
+    def get_commits(self, branch: str) -> List[Dict]:
+        """
+        Get all commits in a branch.
         
         Args:
-            commit (dict): The initial commit object
+            branch (str): The branch name
+            
+        Returns:
+            List[Dict]: List of commit objects
         """
-        commit_id = commit.get('id')
-        author = commit.get('author', {}).get('displayName', 'Unknown')
-        self.logger.info(f"Processing initial commit: {commit_id[:8]} by {author}")
+        all_commits = []
+        start = 0
+        limit = 100
+        is_last_page = False
         
-        # Fetch the changes for the initial commit
-        url = f"{self.base_url}/commits/{commit_id}/changes"
-        params = {'limit': 1000}
+        logger.info(f"Fetching commits for branch: {branch}")
         
-        response = self.session.get(url, params=params)
-        
-        if response.status_code != 200:
-            self.logger.error(f"Error fetching changes for initial commit: {response.status_code}")
-            return
-            
-        data = response.json()
-        changes = data.get('values', [])
-        
-        # Process all files in the initial commit as "added"
-        for change in changes:
-            path = change.get('path', {}).get('toString', '')
-            content_id = change.get('contentId', '')
-            
-            # Track the file
-            self.file_history[path] = {
-                'commit_id': commit_id,
-                'author': author,
-                'content_id': content_id,
-                'status': 'ADDED'
+        while not is_last_page:
+            params = {
+                "until": branch,
+                "start": start,
+                "limit": limit
             }
             
-            # Update author stats
-            self.authors[author]['commits'] += 1
-            self.authors[author]['files_added'] += 1
+            response = self._make_request("/commits", params)
             
-            # Update line counts if available
-            if 'size' in change:
-                self.authors[author]['lines_added'] += change.get('size', 0)
+            if "values" in response:
+                all_commits.extend(response["values"])
+                
+            is_last_page = response.get("isLastPage", True)
+            start = response.get("nextPageStart", 0)
+            
+            if not is_last_page:
+                logger.debug(f"Fetched page of commits, next page starts at: {start}")
+        
+        logger.info(f"Retrieved {len(all_commits)} commits from branch: {branch}")
+        return all_commits
     
-    def _analyze_commit_changes(self, current_commit, previous_commit):
+    def get_commit_changes(self, current_commit_id: str, previous_commit_id: str) -> List[Dict]:
         """
-        Analyze changes between two commits.
+        Get changes between two commits.
         
         Args:
-            current_commit (dict): The current commit object
-            previous_commit (dict): The previous commit object to compare against
+            current_commit_id (str): The ID of the current commit
+            previous_commit_id (str): The ID of the previous commit
+            
+        Returns:
+            List[Dict]: List of changes between the commits
         """
-        current_id = current_commit.get('id')
-        previous_id = previous_commit.get('id')
-        author = current_commit.get('author', {}).get('displayName', 'Unknown')
+        all_changes = []
+        start = 0
+        limit = 1000  # Using the recommended limit from instructions
+        is_last_page = False
         
-        self.logger.info(f"Analyzing changes: {previous_id[:8]} → {current_id[:8]} by {author}")
+        logger.info(f"Fetching changes between commits: {previous_commit_id} and {current_commit_id}")
         
-        # Fetch the changes between the two commits
-        url = f"{self.base_url}/commits/{current_id}/changes"
-        params = {
-            'since': previous_id,
-            'start': 0,
-            'limit': 1000
-        }
-        
-        response = self.session.get(url, params=params)
-        
-        if response.status_code != 200:
-            self.logger.error(f"Error fetching changes between commits: {response.status_code}")
-            return
+        while not is_last_page:
+            params = {
+                "since": previous_commit_id,
+                "start": start,
+                "limit": limit
+            }
             
-        data = response.json()
-        changes = data.get('values', [])
+            endpoint = f"/commits/{current_commit_id}/changes"
+            response = self._make_request(endpoint, params)
+            
+            if "values" in response:
+                all_changes.extend(response["values"])
+                
+            is_last_page = response.get("isLastPage", True)
+            start = response.get("nextPageStart", 0)
+            
+            if not is_last_page:
+                logger.debug(f"Fetched page of changes, next page starts at: {start}")
         
-        # Process all changes
-        for change in changes:
-            path = change.get('path', {}).get('toString', '')
-            content_id = change.get('contentId', '')
-            node_type = change.get('nodeType', '')
-            type_of_change = change.get('type', '')
-            
-            # Update author stats
-            self.authors[author]['commits'] = self.authors[author]['commits'] + 1 if i == 0 else self.authors[author]['commits']
-            
-            # Track file changes
-            if type_of_change == 'ADD':
-                self.file_history[path] = {
-                    'commit_id': current_id,
-                    'author': author,
-                    'content_id': content_id,
-                    'status': 'ADDED'
-                }
-                self.authors[author]['files_added'] += 1
-                self.authors[author]['lines_added'] += change.get('size', 0)
-                
-            elif type_of_change == 'DELETE':
-                if path in self.file_history:
-                    self.file_history[path]['status'] = 'DELETED'
-                    self.file_history[path]['deleted_by'] = author
-                    self.file_history[path]['deleted_in'] = current_id
-                
-                self.authors[author]['files_removed'] += 1
-                self.authors[author]['lines_removed'] += change.get('size', 0)
-                
-            elif type_of_change == 'MOVE':
-                source_path = change.get('srcPath', {}).get('toString', '')
-                
-                # Update the file history for the source path
-                if source_path in self.file_history:
-                    self.file_history[source_path]['status'] = 'MOVED'
-                    self.file_history[source_path]['moved_to'] = path
-                
-                # Add the new path
-                self.file_history[path] = {
-                    'commit_id': current_id,
-                    'author': author,
-                    'content_id': content_id,
-                    'status': 'ADDED',
-                    'moved_from': source_path
-                }
-                
-                # This is considered a modification
-                self.authors[author]['files_modified'] += 1
-                
-            elif type_of_change == 'MODIFY':
-                # Update existing file stats
-                if path in self.file_history:
-                    old_content_id = self.file_history[path].get('content_id', '')
-                    
-                    # Only count as modified if content actually changed
-                    if old_content_id != content_id:
-                        self.file_history[path]['content_id'] = content_id
-                        self.file_history[path]['last_modified_by'] = author
-                        self.file_history[path]['last_modified_in'] = current_id
-                        
-                        # Update line count stats
-                        self.authors[author]['files_modified'] += 1
-                        
-                        # For modifications, we need to get the specific line changes
-                        self._update_line_changes(current_id, path, author)
+        logger.info(f"Retrieved {len(all_changes)} changes between commits")
+        return all_changes
+
+
+class CommitAnalyzer:
+    """
+    Analyzes commits and their changes to generate statistics.
+    """
     
-    def _update_line_changes(self, commit_id, path, author):
+    def __init__(self, bitbucket_client: BitbucketClient):
         """
-        Get detailed line changes for a modified file.
+        Initialize the commit analyzer.
         
         Args:
-            commit_id (str): The commit ID
-            path (str): The file path
-            author (str): The author's name
+            bitbucket_client (BitbucketClient): An initialized Bitbucket client
         """
-        url = f"{self.base_url}/commits/{commit_id}/diff/{path}"
+        self.client = bitbucket_client
+        logger.info("Initialized CommitAnalyzer")
         
-        response = self.session.get(url)
+    def is_merge_commit(self, commit: Dict) -> bool:
+        """
+        Determine if a commit is a merge commit.
         
-        if response.status_code != 200:
-            self.logger.warning(f"Could not get diff for {path} in commit {commit_id[:8]}")
-            return
+        Args:
+            commit (Dict): The commit object
             
-        diff_content = response.text
+        Returns:
+            bool: True if the commit is a merge commit, False otherwise
+        """
+        # A merge commit typically has more than one parent
+        return len(commit.get("parents", [])) > 1
+    
+    def is_initial_commit(self, commit: Dict) -> bool:
+        """
+        Determine if a commit is an initial commit.
         
-        # Parse the diff to get line changes
+        Args:
+            commit (Dict): The commit object
+            
+        Returns:
+            bool: True if the commit is an initial commit, False otherwise
+        """
+        # An initial commit has no parents
+        return len(commit.get("parents", [])) == 0
+    
+    def filter_significant_commits(self, commits: List[Dict]) -> List[Dict]:
+        """
+        Filter commits to only include initial and merge commits.
+        
+        Args:
+            commits (List[Dict]): List of all commits
+            
+        Returns:
+            List[Dict]: Filtered list containing only initial and merge commits
+        """
+        filtered_commits = []
+        
+        for commit in commits:
+            if self.is_initial_commit(commit) or self.is_merge_commit(commit):
+                filtered_commits.append(commit)
+                
+        logger.info(f"Filtered {len(filtered_commits)} significant commits from {len(commits)} total commits")
+        return filtered_commits
+    
+    def should_include_file(self, file_path: str, excluded_extensions: List[str] = None) -> bool:
+        """
+        Determine if a file should be included in the analysis based on its extension.
+        
+        Args:
+            file_path (str): The file path
+            excluded_extensions (List[str], optional): List of file extensions to exclude
+            
+        Returns:
+            bool: True if the file should be included, False otherwise
+        """
+        if not excluded_extensions:
+            return True
+            
+        # Get the file extension (lowercase)
+        _, ext = os.path.splitext(file_path)
+        ext = ext.lower()
+        
+        # Check if the extension is in the excluded list
+        return ext not in excluded_extensions
+    
+    def analyze_commit_changes(self, current_commit: Dict, previous_commit_id: Optional[str] = None,
+                               excluded_extensions: List[str] = None) -> Dict:
+        """
+        Analyze changes between the current commit and a previous commit.
+        
+        Args:
+            current_commit (Dict): The current commit object
+            previous_commit_id (str, optional): The ID of the previous commit. 
+                                               If None, uses the first parent of the current commit.
+            excluded_extensions (List[str], optional): List of file extensions to exclude
+            
+        Returns:
+            Dict: Analysis results including lines added, removed, and net change
+        """
+        current_commit_id = current_commit["id"]
+        
+        # If previous_commit_id is not provided, use the first parent
+        if previous_commit_id is None and not self.is_initial_commit(current_commit):
+            previous_commit_id = current_commit["parents"][0]["id"]
+            logger.debug(f"Using parent commit {previous_commit_id} as previous commit")
+        
+        # For initial commits, we can't compare with a previous commit
+        if previous_commit_id is None:
+            logger.info(f"Commit {current_commit_id[:7]} is an initial commit, no comparison possible")
+            return {
+                "commit_id": current_commit_id,
+                "author": current_commit.get("author", {}).get("name", "Unknown"),
+                "date": current_commit.get("authorTimestamp", 0),
+                "message": current_commit.get("message", ""),
+                "lines_added": 0,
+                "lines_removed": 0,
+                "net_change": 0,
+                "files_changed": 0,
+                "is_initial": True,
+                "is_merge": False
+            }
+        
+        # Get changes between commits
+        changes = self.client.get_commit_changes(current_commit_id, previous_commit_id)
+        
+        # Initialize counters
         lines_added = 0
         lines_removed = 0
+        files_changed = 0
         
-        for line in diff_content.split('\n'):
-            if line.startswith('+') and not line.startswith('+++'):
-                lines_added += 1
-            elif line.startswith('-') and not line.startswith('---'):
-                lines_removed += 1
+        # Process each changed file
+        for change in changes:
+            # Check if we should include this file
+            if "path" in change and not self.should_include_file(change["path"], excluded_extensions):
+                logger.debug(f"Skipping excluded file: {change['path']}")
+                continue
+                
+            files_changed += 1
+            
+            # Extract line counts from the change
+            if "type" in change:
+                if change["type"] == "ADD":
+                    # New file - all lines are added
+                    lines_added += change.get("linesAdded", 0) or 0
+                elif change["type"] == "DELETE":
+                    # Deleted file - all lines are removed
+                    lines_removed += change.get("linesRemoved", 0) or 0
+                elif change["type"] == "MODIFY":
+                    # Modified file - both additions and removals
+                    lines_added += change.get("linesAdded", 0) or 0
+                    lines_removed += change.get("linesRemoved", 0) or 0
+                # There's also MOVE and COPY, but they don't directly affect line counts
         
-        # Update author stats
-        self.authors[author]['lines_added'] += lines_added
-        self.authors[author]['lines_removed'] += lines_removed
-    
-    def generate_report(self):
-        """
-        Generate a report of author contributions and file statistics.
+        # Calculate net change
+        net_change = lines_added - lines_removed
         
-        Returns:
-            dict: Report data
-        """
-        self.logger.info("Generating final report")
+        logger.info(f"Analyzed commit {current_commit_id[:7]}: +{lines_added}, -{lines_removed}, net: {net_change}")
         
-        # Calculate current file counts
-        current_files = {}
-        for path, info in self.file_history.items():
-            if info.get('status') not in ['DELETED', 'MOVED']:
-                current_files[path] = info
-        
-        # Prepare the report
-        report = {
-            'repository': f"{self.project_key}/{self.repository_slug}",
-            'analysis_date': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            'author_stats': dict(self.authors),
-            'file_counts': {
-                'total_files_ever': len(self.file_history),
-                'current_files': len(current_files),
-                'deleted_files': sum(1 for info in self.file_history.values() if info.get('status') == 'DELETED'),
-                'moved_files': sum(1 for info in self.file_history.values() if info.get('status') == 'MOVED')
-            },
-            'file_types': self._get_file_type_stats(current_files)
+        return {
+            "commit_id": current_commit_id,
+            "author": current_commit.get("author", {}).get("name", "Unknown"),
+            "date": current_commit.get("authorTimestamp", 0),
+            "message": current_commit.get("message", ""),
+            "lines_added": lines_added,
+            "lines_removed": lines_removed,
+            "net_change": net_change,
+            "files_changed": files_changed,
+            "is_initial": self.is_initial_commit(current_commit),
+            "is_merge": self.is_merge_commit(current_commit)
         }
-        
-        return report
     
-    def _get_file_type_stats(self, files):
+    def analyze_branch(self, branch: str, excluded_extensions: List[str] = None) -> List[Dict]:
         """
-        Get statistics about file types in the repository.
+        Analyze all significant commits in a branch.
         
         Args:
-            files (dict): Dictionary of current files
+            branch (str): The branch name
+            excluded_extensions (List[str], optional): List of file extensions to exclude
             
         Returns:
-            dict: File type statistics
+            List[Dict]: Analysis results for each significant commit
         """
-        file_types = defaultdict(int)
+        logger.info(f"Starting analysis of branch: {branch}")
         
-        for path in files:
-            if '.' in path:
-                extension = path.split('.')[-1].lower()
-                file_types[extension] += 1
-            else:
-                file_types['no_extension'] += 1
+        # Get all commits in the branch
+        all_commits = self.client.get_commits(branch)
         
-        return dict(file_types)
+        if not all_commits:
+            logger.warning(f"No commits found in branch: {branch}")
+            return []
+        
+        # Filter to only include initial and merge commits
+        significant_commits = self.filter_significant_commits(all_commits)
+        
+        if not significant_commits:
+            logger.warning(f"No significant commits found in branch: {branch}")
+            return []
+        
+        # Analyze each significant commit
+        results = []
+        previous_commit_id = None
+        
+        # Process commits from oldest to newest
+        for commit in reversed(significant_commits):
+            analysis = self.analyze_commit_changes(commit, previous_commit_id, excluded_extensions)
+            results.append(analysis)
+            previous_commit_id = commit["id"]
+        
+        logger.info(f"Completed analysis of {len(results)} significant commits")
+        return results
+
+
+class Reporter:
+    """
+    Generates reports based on commit analysis results.
+    """
+    
+    @staticmethod
+    def format_timestamp(timestamp: int) -> str:
+        """
+        Format a Unix timestamp as a human-readable date.
+        
+        Args:
+            timestamp (int): Unix timestamp in milliseconds
+            
+        Returns:
+            str: Formatted date string
+        """
+        if not timestamp:
+            return "Unknown date"
+        
+        # Convert milliseconds to seconds
+        dt = datetime.fromtimestamp(timestamp / 1000)
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+    
+    @staticmethod
+    def generate_text_report(analysis_results: List[Dict]) -> str:
+        """
+        Generate a text report from commit analysis results.
+        
+        Args:
+            analysis_results (List[Dict]): List of commit analysis results
+            
+        Returns:
+            str: Formatted text report
+        """
+        if not analysis_results:
+            return "No results to report."
+        
+        report_lines = ["Bitbucket Commit Analysis Report", "=" * 30, ""]
+        
+        for result in analysis_results:
+            commit_type = "Initial Commit" if result["is_initial"] else "Merge Commit"
+            
+            report_lines.append(f"Commit: {result['commit_id'][:7]} ({commit_type})")
+            report_lines.append(f"Author: {result['author']}")
+            report_lines.append(f"Date: {Reporter.format_timestamp(result['date'])}")
+            report_lines.append(f"Message: {result['message'].splitlines()[0]}")
+            report_lines.append(f"Files Changed: {result['files_changed']}")
+            report_lines.append(f"Lines Added: {result['lines_added']}")
+            report_lines.append(f"Lines Removed: {result['lines_removed']}")
+            report_lines.append(f"Net Change: {result['net_change']}")
+            report_lines.append("-" * 30)
+            report_lines.append("")
+        
+        # Add summary
+        total_added = sum(r["lines_added"] for r in analysis_results)
+        total_removed = sum(r["lines_removed"] for r in analysis_results)
+        total_net = sum(r["net_change"] for r in analysis_results)
+        total_files = sum(r["files_changed"] for r in analysis_results)
+        
+        report_lines.append("Summary")
+        report_lines.append("=" * 30)
+        report_lines.append(f"Total Commits Analyzed: {len(analysis_results)}")
+        report_lines.append(f"Total Files Changed: {total_files}")
+        report_lines.append(f"Total Lines Added: {total_added}")
+        report_lines.append(f"Total Lines Removed: {total_removed}")
+        report_lines.append(f"Total Net Change: {total_net}")
+        
+        return "\n".join(report_lines)
+    
+    @staticmethod
+    def generate_json_report(analysis_results: List[Dict]) -> str:
+        """
+        Generate a JSON report from commit analysis results.
+        
+        Args:
+            analysis_results (List[Dict]): List of commit analysis results
+            
+        Returns:
+            str: JSON formatted report
+        """
+        if not analysis_results:
+            return json.dumps({"error": "No results to report."})
+        
+        # Calculate summary
+        summary = {
+            "total_commits": len(analysis_results),
+            "total_files_changed": sum(r["files_changed"] for r in analysis_results),
+            "total_lines_added": sum(r["lines_added"] for r in analysis_results),
+            "total_lines_removed": sum(r["lines_removed"] for r in analysis_results),
+            "total_net_change": sum(r["net_change"] for r in analysis_results)
+        }
+        
+        # Format the results
+        report_data = {
+            "summary": summary,
+            "commits": analysis_results
+        }
+        
+        return json.dumps(report_data, indent=2)
 
 
 def main():
-    """Main function to run the Bitbucket analyzer."""
-    parser = argparse.ArgumentParser(description='Analyze Bitbucket repository changes and author contributions')
+    """
+    Main entry point for the Bitbucket analyzer script.
+    """
+    parser = argparse.ArgumentParser(description="Analyze commits in a Bitbucket branch")
     
-    parser.add_argument('--server', required=True, help='Bitbucket server URL')
-    parser.add_argument('--project', required=True, help='Project key')
-    parser.add_argument('--repo', required=True, help='Repository slug')
-    parser.add_argument('--username', help='Bitbucket username')
-    parser.add_argument('--password', help='Bitbucket password or token')
-    parser.add_argument('--output', default='report.json', help='Output file name')
+    parser.add_argument("--url", required=True, help="Bitbucket server URL")
+    parser.add_argument("--project", required=True, help="Bitbucket project key")
+    parser.add_argument("--repo", required=True, help="Repository name")
+    parser.add_argument("--branch", required=True, help="Branch to analyze")
+    parser.add_argument("--username", required=True, help="Bitbucket username")
+    parser.add_argument("--password", required=True, help="Bitbucket password or token")
+    parser.add_argument("--format", choices=["text", "json"], default="text", help="Output format (text or json)")
+    parser.add_argument("--output", help="Output file (if not specified, prints to stdout)")
+    parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
+    parser.add_argument("--exclude", nargs="+", help="File extensions to exclude (e.g., .jpg .png)")
     
     args = parser.parse_args()
     
-    # Set up authentication if provided
-    auth = None
-    if args.username and args.password:
-        auth = (args.username, args.password)
+    # Set logging level based on verbosity
+    if args.verbose:
+        logger.setLevel(logging.DEBUG)
     
-    # Create the analyzer
-    analyzer = BitbucketAnalyzer(
-        server_url=args.server,
-        project_key=args.project,
-        repository_slug=args.repo,
-        auth=auth
-    )
+    # Process excluded extensions
+    excluded_extensions = None
+    if args.exclude:
+        excluded_extensions = [ext.lower() if ext.startswith('.') else f'.{ext.lower()}' for ext in args.exclude]
+        logger.info(f"Excluding file extensions: {', '.join(excluded_extensions)}")
     
-    # Get commits and analyze
-    commits = analyzer.get_commits()
-    if commits:
-        analyzer.analyze_changes(commits)
-        report = analyzer.generate_report()
-        
-        # Save the report
-        with open(args.output, 'w') as f:
-            json.dump(report, f, indent=2)
-        
-        print(f"Analysis complete! Report saved to {args.output}")
-        
-        # Print a summary to console
-        print("\nSummary:")
-        print(f"Repository: {report['repository']}")
-        print(f"Total files tracked: {report['file_counts']['total_files_ever']}")
-        print(f"Current files: {report['file_counts']['current_files']}")
-        print("\nTop contributors:")
-        
-        # Sort authors by lines of code contributed
-        sorted_authors = sorted(
-            report['author_stats'].items(),
-            key=lambda x: x[1]['lines_added'] + x[1]['lines_removed'],
-            reverse=True
+    try:
+        # Initialize the Bitbucket client
+        client = BitbucketClient(
+            base_url=args.url,
+            project=args.project,
+            repository=args.repo,
+            username=args.username,
+            password=args.password
         )
         
-        for author, stats in sorted_authors[:5]:  # Show top 5
-            total_lines = stats['lines_added'] + stats['lines_removed']
-            print(f"  {author}: {total_lines} lines ({stats['lines_added']} added, {stats['lines_removed']} removed)")
+        # Initialize the analyzer
+        analyzer = CommitAnalyzer(client)
+        
+        # Analyze the branch
+        results = analyzer.analyze_branch(args.branch, excluded_extensions)
+        
+        # Generate the report
+        if args.format == "json":
+            report = Reporter.generate_json_report(results)
+        else:
+            report = Reporter.generate_text_report(results)
+        
+        # Output the report
+        if args.output:
+            with open(args.output, "w") as f:
+                f.write(report)
+            logger.info(f"Report written to {args.output}")
+        else:
+            print(report)
+        
+    except Exception as e:
+        logger.error(f"An error occurred: {e}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
